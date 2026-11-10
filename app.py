@@ -55,6 +55,9 @@ DEFAULT_SETTINGS = {
     "volume_mult": 2.0,      # volume spike = N x average of previous 20 candles
     "min_breakout_atr": 0.75, # minimum close distance beyond a broken level for Telegram
     "cooldown_minutes": 30,  # no repeated alert of the same kind within this time
+    # After a confirmed signal candle closes, evaluate the direction after this horizon.
+    "prediction_horizons_minutes": {"15m": 60, "1h": 240, "4h": 1440, "1d": 4320},
+    "prediction_neutral_pct": 0.25,  # smaller absolute moves are neutral, not wins/losses
 }
 
 # interval/period are what Yahoo Finance understands; ttl = seconds we reuse cached data
@@ -171,6 +174,10 @@ def load_settings() -> dict:
                 for key in DEFAULT_SETTINGS:
                     if key in saved:
                         settings[key] = saved[key]
+                # Keep new timeframe defaults when an older settings.json stores only some horizons.
+                horizons = dict(DEFAULT_SETTINGS["prediction_horizons_minutes"])
+                horizons.update(settings.get("prediction_horizons_minutes", {}))
+                settings["prediction_horizons_minutes"] = horizons
                 # older versions had a single "telegram_5m" switch: keep the user's choice
                 if "telegram_timeframes" not in saved and saved.get("telegram_5m") is False:
                     settings["telegram_timeframes"] = [t for t in settings["telegram_timeframes"] if t != "5m"]
@@ -889,41 +896,291 @@ def pattern_events(closed, asset, tf, only_last=True) -> list:
 # =============================================================================
 # 6. DATABASE (SQLite): one table, alert history survives restarts
 # =============================================================================
+def setting_value(name: str, default="") -> str:
+    """Read a setting from environment/.env first, then Streamlit Cloud Secrets."""
+    value = os.getenv(name, "")
+    if value:
+        return str(value).strip()
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:  # StreamlitSecretNotFoundError when no secrets file exists
+        value = default
+    return str(value or "").strip()
+
+
+def database_url() -> str:
+    return setting_value("DATABASE_URL")
+
+
+def _open_db():
+    """Use PostgreSQL when DATABASE_URL is configured; otherwise use local SQLite."""
+    url = database_url()
+    if url:
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise RuntimeError("DATABASE_URL is set, but psycopg is missing. Add psycopg[binary] to requirements.txt.") from exc
+        return psycopg.connect(url), True
+    return sqlite3.connect(DB_PATH, timeout=10), False
+
+
+def _db_sql(sql: str, is_postgres: bool) -> str:
+    return sql.replace("?", "%s") if is_postgres else sql
+
+
 def db_query(sql, params=()):
     with RT.db_lock:
-        con = sqlite3.connect(DB_PATH, timeout=10)
+        con, is_postgres = _open_db()
         try:
-            return con.execute(sql, params).fetchall()
+            cur = con.execute(_db_sql(sql, is_postgres), params)
+            return [tuple(row) for row in cur.fetchall()]
         finally:
             con.close()
 
 
 def db_execute(sql, params=()):
     with RT.db_lock:
-        con = sqlite3.connect(DB_PATH, timeout=10)
+        con, is_postgres = _open_db()
         try:
             with con:
-                cur = con.execute(sql, params)
-            return cur.lastrowid
+                query = _db_sql(sql, is_postgres)
+                if is_postgres and query.lstrip().upper().startswith("INSERT") and "RETURNING" not in query.upper():
+                    cur = con.execute(query.rstrip().rstrip(";") + " RETURNING id", params)
+                    row = cur.fetchone()
+                    return row[0] if row else None
+                cur = con.execute(query, params)
+                return cur.lastrowid if not is_postgres else None
         finally:
             con.close()
 
 
 def init_db():
-    db_execute("""CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT NOT NULL,
-        asset TEXT NOT NULL,
-        alert_type TEXT NOT NULL,
-        timeframe TEXT NOT NULL,
-        status TEXT NOT NULL,
-        price REAL,
-        change_pct REAL,
-        description TEXT NOT NULL,
-        event_time TEXT NOT NULL)""")
-    db_execute("CREATE INDEX IF NOT EXISTS idx_alerts_lookup "
-               "ON alerts (asset, alert_type, timeframe, status, created_at)")
+    if database_url():
+        alerts_sql = """CREATE TABLE IF NOT EXISTS alerts (
+            id BIGSERIAL PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            alert_type TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            status TEXT NOT NULL,
+            price DOUBLE PRECISION,
+            change_pct DOUBLE PRECISION,
+            description TEXT NOT NULL,
+            event_time TEXT NOT NULL)"""
+        predictions_sql = """CREATE TABLE IF NOT EXISTS predictions (
+            id BIGSERIAL PRIMARY KEY,
+            alert_id BIGINT NOT NULL UNIQUE REFERENCES alerts(id),
+            asset TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_price DOUBLE PRECISION NOT NULL,
+            signal_time TEXT NOT NULL,
+            horizon_minutes INTEGER NOT NULL,
+            neutral_pct DOUBLE PRECISION NOT NULL DEFAULT 0.25,
+            due_at TEXT NOT NULL,
+            telegram_sent INTEGER NOT NULL DEFAULT 0,
+            evaluated_at TEXT,
+            exit_candle_time TEXT,
+            exit_price DOUBLE PRECISION,
+            return_pct DOUBLE PRECISION,
+            outcome TEXT,
+            result_notified INTEGER NOT NULL DEFAULT 0)"""
+    else:
+        alerts_sql = """CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            alert_type TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            status TEXT NOT NULL,
+            price REAL,
+            change_pct REAL,
+            description TEXT NOT NULL,
+            event_time TEXT NOT NULL)"""
+        predictions_sql = """CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER NOT NULL UNIQUE REFERENCES alerts(id),
+            asset TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            signal_time TEXT NOT NULL,
+            horizon_minutes INTEGER NOT NULL,
+            neutral_pct REAL NOT NULL DEFAULT 0.25,
+            due_at TEXT NOT NULL,
+            telegram_sent INTEGER NOT NULL DEFAULT 0,
+            evaluated_at TEXT,
+            exit_candle_time TEXT,
+            exit_price REAL,
+            return_pct REAL,
+            outcome TEXT,
+            result_notified INTEGER NOT NULL DEFAULT 0)"""
+    db_execute(alerts_sql)
+    db_execute("CREATE INDEX IF NOT EXISTS idx_alerts_lookup ON alerts (asset, alert_type, timeframe, status, created_at)")
+    db_execute(predictions_sql)
+    db_execute("CREATE INDEX IF NOT EXISTS idx_predictions_due ON predictions (outcome, due_at)")
+    db_execute("CREATE INDEX IF NOT EXISTS idx_predictions_stats ON predictions (timeframe, pattern, outcome)")
 
+
+def prediction_horizon(tf: str, settings: dict) -> int:
+    horizons = settings.get("prediction_horizons_minutes", DEFAULT_SETTINGS["prediction_horizons_minutes"])
+    return max(1, int(horizons.get(tf, INTERVAL_MIN[tf] * 4)))
+
+
+def is_prediction_event(ev: dict) -> bool:
+    """Only actionable confirmed directional events count as predictions."""
+    return (ev.get("status") == "Confirmed"
+            and ev.get("direction") in ("bull", "bear")
+            and bool(ev.get("notify")))
+
+
+def record_prediction(alert_id: int, ev: dict, tf: str, settings: dict):
+    """Save one immutable prediction per stored alert. Entry is the signal candle close."""
+    if not is_prediction_event(ev):
+        return None
+    horizon = prediction_horizon(tf, settings)
+    signal_time = pd.Timestamp(ev["event_time"]) + pd.Timedelta(minutes=INTERVAL_MIN[tf])
+    due_at = signal_time + pd.Timedelta(minutes=horizon)
+    ev["prediction_horizon_minutes"] = horizon
+    existing = db_query("SELECT id FROM predictions WHERE alert_id=?", (alert_id,))
+    if existing:
+        return int(existing[0][0])
+    return db_execute(
+        "INSERT INTO predictions (alert_id, asset, timeframe, pattern, direction, entry_price, signal_time, "
+        "horizon_minutes, neutral_pct, due_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (alert_id, ev["asset"], tf, ev["alert_type"], ev["direction"], float(ev["price"]),
+         signal_time.strftime("%Y-%m-%d %H:%M:%S"), horizon,
+         float(settings.get("prediction_neutral_pct", 0.25)), due_at.strftime("%Y-%m-%d %H:%M:%S")))
+
+
+def mark_prediction_telegram_sent(prediction_id: int):
+    db_execute("UPDATE predictions SET telegram_sent=1 WHERE id=?", (prediction_id,))
+
+
+def _prediction_outcome(direction: str, return_pct: float, neutral_pct: float) -> str:
+    if direction == "bull":
+        if return_pct >= neutral_pct:
+            return "SUCCESS"
+        if return_pct <= -neutral_pct:
+            return "FAILED"
+    else:
+        if return_pct <= -neutral_pct:
+            return "SUCCESS"
+        if return_pct >= neutral_pct:
+            return "FAILED"
+    return "NEUTRAL"
+
+
+def evaluate_due_predictions(settings=None) -> int:
+    """Evaluate due predictions at the first completed candle closing at/after their horizon."""
+    settings = settings or load_settings()
+    now_text = now_naive_utc().strftime("%Y-%m-%d %H:%M:%S")
+    due = db_query(
+        "SELECT id, asset, timeframe, direction, entry_price, due_at, neutral_pct, telegram_sent "
+        "FROM predictions WHERE outcome IS NULL AND due_at<=? ORDER BY due_at LIMIT 100",
+        (now_text,))
+    evaluated = 0
+    for pred_id, asset, tf, direction, entry, due_at, neutral_pct, telegram_sent in due:
+        try:
+            res = fetch_candles(asset, tf)
+            if res.df is None or res.df.empty:
+                continue  # data provider may be temporarily unavailable; retry next monitor cycle
+            closed = closed_candles(res.df, tf)
+            if closed.empty:
+                continue
+            due_ts = pd.Timestamp(due_at)
+            candle_closes = closed.index + pd.Timedelta(minutes=INTERVAL_MIN[tf])
+            eligible = np.flatnonzero(candle_closes >= due_ts)
+            if len(eligible) == 0:
+                continue  # the target candle has not closed yet
+            pos = int(eligible[0])
+            exit_price = float(closed["Close"].iloc[pos])
+            if entry <= 0 or not np.isfinite(exit_price):
+                continue
+            return_pct = (exit_price / float(entry) - 1.0) * 100.0
+            outcome = _prediction_outcome(direction, return_pct, float(neutral_pct))
+            exit_time = pd.Timestamp(candle_closes[pos]).strftime("%Y-%m-%d %H:%M:%S")
+            evaluated_at = now_text
+            db_execute(
+                "UPDATE predictions SET evaluated_at=?, exit_candle_time=?, exit_price=?, return_pct=?, outcome=? "
+                "WHERE id=? AND outcome IS NULL",
+                (evaluated_at, exit_time, exit_price, return_pct, outcome, pred_id))
+            evaluated += 1
+        except Exception as exc:
+            log.warning("Prediction evaluation failed for %s %s: %s", asset, tf, redact(exc))
+
+    # Deliver results only for original signals that were actually sent to this Telegram chat.
+    if telegram_configured():
+        unsent = db_query(
+            "SELECT id, asset, timeframe, pattern, direction, entry_price, exit_price, return_pct, outcome, "
+            "horizon_minutes, exit_candle_time FROM predictions "
+            "WHERE outcome IS NOT NULL AND telegram_sent=1 AND result_notified=0 ORDER BY evaluated_at LIMIT 50")
+        for row in unsent:
+            (pred_id, asset, tf, pattern, direction, entry, exit_price, change, outcome,
+             horizon, exit_time) = row
+            side = "LONG" if direction == "bull" else "SHORT"
+            icon = {"SUCCESS": "✅", "FAILED": "❌", "NEUTRAL": "➖"}[outcome]
+            message = (f"{icon} Prediction result: {outcome}\n{asset} | {side} | {pattern} | {tf}\n"
+                       f"Entry: {fmt_price(entry)}\nCheck price: {fmt_price(exit_price)}\n"
+                       f"Price change: {fmt_pct(change)}\nPlanned horizon: {horizon} min\n"
+                       f"Evaluation candle close: {exit_time} UTC")
+            ok, _ = tg_send_message(message)
+            if ok:
+                db_execute("UPDATE predictions SET result_notified=1 WHERE id=?", (pred_id,))
+    return evaluated
+
+
+def _prediction_filters(timeframe=None, pattern=None):
+    where, params = ["outcome IS NOT NULL"], []
+    if timeframe:
+        where.append("timeframe=?")
+        params.append(timeframe)
+    if pattern:
+        where.append("pattern LIKE ?")
+        params.append(f"%{pattern}%")
+    return " AND ".join(where), params
+
+
+def cmd_stats(mode="summary", timeframe=None, pattern=None) -> str:
+    where, params = _prediction_filters(timeframe, pattern)
+    totals = db_query(
+        f"SELECT COUNT(*), SUM(CASE WHEN outcome='SUCCESS' THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN outcome='FAILED' THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN outcome='NEUTRAL' THEN 1 ELSE 0 END) FROM predictions WHERE {where}", tuple(params))[0]
+    total, wins, losses, neutral = (int(v or 0) for v in totals)
+    decided = wins + losses
+    win_rate = wins / decided * 100 if decided else 0.0
+    title = "📊 Prediction statistics"
+    if timeframe:
+        title += f" — {timeframe}"
+    if pattern:
+        title += f" — {pattern}"
+    lines = [title, f"Completed: {total} | ✅ {wins} | ❌ {losses} | ➖ {neutral}",
+             f"Win rate (excluding neutral): {win_rate:.1f}% ({wins}/{decided})"]
+    if total == 0:
+        lines.append("No evaluated predictions yet. Pending predictions are not included.")
+        return "\n".join(lines)
+    if mode in ("patterns", "timeframes", "detailed"):
+        group_cols = {"patterns": "pattern", "timeframes": "timeframe",
+                      "detailed": "timeframe, pattern"}[mode]
+        rows = db_query(
+            f"SELECT {group_cols}, COUNT(*), SUM(CASE WHEN outcome='SUCCESS' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN outcome='FAILED' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN outcome='NEUTRAL' THEN 1 ELSE 0 END) "
+            f"FROM predictions WHERE {where} GROUP BY {group_cols} ORDER BY COUNT(*) DESC LIMIT 25",
+            tuple(params))
+        lines.extend(["", f"By {mode}:"])
+        for row in rows:
+            if mode == "detailed":
+                label = f"{row[0]} / {row[1]}"
+            else:
+                label = str(row[0])
+            count, w, l, n = (int(v or 0) for v in row[-4:])
+            rate = w / (w + l) * 100 if w + l else 0.0
+            lines.append(f"• {label}: {rate:.1f}% | {count} total (✅{w} ❌{l} ➖{n})")
+    return "\n".join(lines)
 
 def try_register_alert(ev: dict, cooldown_min: int) -> Optional[int]:
     """Store the alert unless it is a duplicate or inside the cooldown. Returns the new id or None.
@@ -1106,11 +1363,11 @@ def render_chart_png(ind, symbol, tf, ev=None) -> Path:
 # 8. TELEGRAM (plain HTTP requests to the official Bot API)
 # =============================================================================
 def tg_token() -> str:
-    return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    return setting_value("TELEGRAM_BOT_TOKEN")
 
 
 def tg_chat_id() -> str:
-    return os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    return setting_value("TELEGRAM_CHAT_ID")
 
 
 def telegram_configured() -> bool:
@@ -1160,6 +1417,9 @@ def build_message(ev: dict) -> str:
         f"Price: {fmt_price(ev['price'])}",
         f"Change: {fmt_pct(ev['change_pct'])} ({ev['change_label']})",
         f"Timeframe: {ev['timeframe']}",
+        *([f"Prediction: {'LONG' if ev['direction'] == 'bull' else 'SHORT'}",
+           f"Result check after: {ev['prediction_horizon_minutes']} min"]
+          if ev.get("prediction_horizon_minutes") else []),
         f"Indicators: {ev['indicators'] or 'n/a'}"])
     tail = f"Candle time: {fmt_ts(ev['event_time'])} UTC\n{DISCLAIMER}"
     room = 1024 - len(head) - len(tail) - len("Why: ") - 2       # 2 line breaks
@@ -1246,17 +1506,22 @@ def cmd_status() -> str:
         f"Volume spike: {cfg['volume_mult']:g}x | cooldown: {cfg['cooldown_minutes']} min",
         f"Minimum structural break for Telegram: {cfg.get('min_breakout_atr', DEFAULT_SETTINGS['min_breakout_atr']):g} ATR",
         f"Sent to Telegram: {', '.join(cfg['telegram_timeframes']) or 'nothing'} (other timeframes: history only)",
+        f"Prediction horizons (min): {cfg.get('prediction_horizons_minutes', DEFAULT_SETTINGS['prediction_horizons_minutes'])}",
+        f"Neutral threshold: {cfg.get('prediction_neutral_pct', 0.25):g}%",
+        f"Database: {'PostgreSQL' if database_url() else 'local SQLite (not durable on ephemeral hosting)'}",
         f"Last monitor error: {s['last_error'] or 'none'}",
         "Data: Yahoo Finance via yfinance (not guaranteed real-time)."])
 
 def help_text(chat_id: str, allowed: bool) -> str:
     lines = ["📈 Trading Intelligence Monitor", f"Your chat ID: {chat_id}"]
     if not allowed:
-        lines.append("To receive alerts here, put this number in TELEGRAM_CHAT_ID in your .env file "
-                     "and restart the app.")
+        lines.append("To receive alerts here, add this chat ID as TELEGRAM_CHAT_ID in Streamlit Cloud → Settings → Secrets "
+                     "(or to your local .env file), then restart the app.")
     lines += ["", "Commands:", "/watchlist - assets and last prices", "/alerts - last 5 alerts",
-              "/status - monitor status", "/test - send a test notification with a chart",
-              "/help - this message", "", DISCLAIMER]
+              "/status - monitor status", "/stats - overall prediction statistics",
+              "/stats patterns - results by pattern", "/stats timeframes - results by timeframe",
+              "/stats detailed - pattern + timeframe", "/stats 1h - one timeframe",
+              "/test - send a test notification with a chart", "/help - this message", "", DISCLAIMER]
     return "\n".join(lines)
 
 
@@ -1279,6 +1544,18 @@ def handle_update(update: dict):
         reply = cmd_alerts()
     elif command == "/status":
         reply = cmd_status()
+    elif command == "/stats":
+        args = text.split()[1:]
+        if not args:
+            reply = cmd_stats()
+        elif args[0].lower() in ("patterns", "timeframes", "detailed"):
+            reply = cmd_stats(mode=args[0].lower())
+        elif args[0].lower() in TIMEFRAMES:
+            reply = cmd_stats(timeframe=args[0].lower())
+        elif args[0].lower() == "pattern" and len(args) > 1:
+            reply = cmd_stats(pattern=" ".join(args[1:]))
+        else:
+            reply = "Usage: /stats | /stats 1h | /stats patterns | /stats timeframes | /stats detailed | /stats pattern Bullish Breakout"
     elif command == "/test":
         ok, info = send_test_notification(chat_id)
         if ok:
@@ -1358,8 +1635,13 @@ def process_event(ev: dict, ind: pd.DataFrame, tf: str, settings: dict):
     log.info("ALERT #%s %s %s (%s, %s)", alert_id, ev["asset"], ev["alert_type"], ev["status"], tf)
     routed = tf in settings.get("telegram_timeframes", list(TIMEFRAMES))   # timeframe routing
     quality_ok = passes_notification_quality(ev, settings)
+    prediction_id = None
+    if is_prediction_event(ev) and quality_ok:
+        prediction_id = record_prediction(alert_id, ev, tf, settings)
     if ev["notify"] and quality_ok and routed and telegram_configured():
         ok, info = send_alert_notification(ev, ind, tf)
+        if ok and prediction_id is not None:
+            mark_prediction_telegram_sent(prediction_id)
         if not ok:
             log.warning("Telegram notification failed: %s", info)
     elif ev["notify"] and not quality_ok:
@@ -1429,6 +1711,10 @@ def monitor_loop():
                 check_pending_symbols(settings)
             except Exception as exc:
                 errors.append(f"pending symbols: {redact(exc)}")
+            try:
+                evaluate_due_predictions(settings)
+            except Exception as exc:
+                errors.append(f"prediction evaluator: {redact(exc)}")
             RT.status["last_cycle"] = utc_now()
             RT.status["cycles"] += 1
         except Exception as exc:
@@ -1531,6 +1817,26 @@ def render_sidebar():
                              "telegram_timeframes": [t for t in TIMEFRAMES if t in tg_tfs]})
             save_settings(settings)
             st.success("Saved. The background monitor uses the new values on its next cycle.")
+
+    sb.subheader("Prediction tracking")
+    with sb.form("prediction_tracking"):
+        horizons_now = settings.get("prediction_horizons_minutes", DEFAULT_SETTINGS["prediction_horizons_minutes"])
+        h15 = st.number_input("15m signal: check after (minutes)", 15, 1440,
+                              int(horizons_now.get("15m", 60)), 15)
+        h1 = st.number_input("1h signal: check after (minutes)", 60, 2880,
+                             int(horizons_now.get("1h", 240)), 60)
+        h4 = st.number_input("4h signal: check after (minutes)", 240, 10080,
+                             int(horizons_now.get("4h", 1440)), 240)
+        h1d = st.number_input("1d signal: check after (minutes)", 1440, 20160,
+                              int(horizons_now.get("1d", 4320)), 1440)
+        neutral_pct = st.number_input("Neutral movement threshold (%)", 0.05, 5.0,
+                                      float(settings.get("prediction_neutral_pct", 0.25)), 0.05)
+        if st.form_submit_button("💾 Save prediction settings"):
+            settings["prediction_horizons_minutes"] = {"15m": int(h15), "1h": int(h1),
+                                                        "4h": int(h4), "1d": int(h1d)}
+            settings["prediction_neutral_pct"] = float(neutral_pct)
+            save_settings(settings)
+            st.success("Prediction settings saved. They apply to new signals; existing predictions keep their original horizon.")
 
     with sb.expander("📨 Telegram notifications"):
         if telegram_configured():

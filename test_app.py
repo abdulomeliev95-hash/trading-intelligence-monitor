@@ -681,6 +681,19 @@ def test_notification_text_has_all_required_items():
         assert part in text
 
 
+def test_confirmed_prediction_notification_shows_long_or_short_and_horizon():
+    ev = app.make_event("BTC-USD", "1h", "Bullish Breakout", "Confirmed", "bull",
+                        pd.Timestamp("2024-01-01 10:00"), 65000, 1.2, "1h candle", "breakout", True)
+    ev["prediction_horizon_minutes"] = 240
+    message = app.build_message(ev)
+    assert "Prediction: LONG" in message
+    assert "Result check after: 240 min" in message
+
+    ev["direction"] = "bear"
+    message = app.build_message(ev)
+    assert "Prediction: SHORT" in message
+
+
 def test_notification_text_fits_telegram_caption_limit():
     ev = notification_event()
     ev["explanation"] = "very long explanation " * 100
@@ -1307,3 +1320,129 @@ def test_chart_draws_forming_pattern_as_dotted_neckline():
     line = [t for t in fig.data if t.name == "Neckline"][0]
     assert line.line.dash == "dot" and "forming" in line.text[1]
     assert not [t for t in fig.data if getattr(t, "mode", None) == "markers"]    # no signal marker
+
+# =============================================================================
+# Prediction tracking and statistics
+# =============================================================================
+def confirmed_prediction_event(tf="1h", direction="bull", ts="2024-01-01 10:00"):
+    return app.make_event("BTC-USD", tf, "Bullish Breakout" if direction == "bull" else "Bearish Breakdown",
+                          "Confirmed", direction, pd.Timestamp(ts), 100.0, 0.8,
+                          f"{tf} candle", "Synthetic confirmed test signal", True)
+
+
+def test_only_confirmed_directional_events_are_predictions():
+    alert_id = app.try_register_alert(confirmed_prediction_event(), 0)
+    assert alert_id is not None
+    pred_id = app.record_prediction(alert_id, confirmed_prediction_event(), "1h", app.load_settings())
+    assert pred_id is not None
+    rows = app.db_query("SELECT direction, timeframe, horizon_minutes, entry_price FROM predictions")
+    assert rows == [("bull", "1h", 240, 100.0)]
+
+
+def test_prediction_horizon_starts_after_signal_candle_closes():
+    ev = confirmed_prediction_event(ts="2024-01-01 10:00")
+    alert_id = app.try_register_alert(ev, 0)
+    app.record_prediction(alert_id, ev, "1h", app.load_settings())
+    row = app.db_query("SELECT signal_time, due_at FROM predictions")[0]
+    assert row == ("2024-01-01 11:00:00", "2024-01-01 15:00:00")
+
+
+def test_process_event_stores_prediction_and_marks_telegram_delivery(monkeypatch):
+    set_telegram(monkeypatch)
+    sent = []
+    monkeypatch.setattr(app, "send_alert_notification", lambda ev, ind, tf, chat_id=None: sent.append(ev) or (True, "ok"))
+    ev = confirmed_prediction_event()
+    ind = add_test_indicators_for_prediction()
+    settings = app.load_settings()
+    app.process_event(ev, ind, "1h", settings)
+    row = app.db_query("SELECT telegram_sent, horizon_minutes FROM predictions")[0]
+    assert row == (1, 240)
+    assert sent and sent[0]["prediction_horizon_minutes"] == 240
+
+
+def add_test_indicators_for_prediction():
+    idx = pd.date_range("2024-01-01 00:00", periods=80, freq="1h")
+    df = pd.DataFrame({"Open": np.linspace(90, 100, 80), "High": np.linspace(91, 101, 80),
+                       "Low": np.linspace(89, 99, 80), "Close": np.linspace(90, 100, 80),
+                       "Volume": np.full(80, 1000.0)}, index=idx)
+    return app.add_indicators(df)
+
+
+def test_potential_and_info_events_do_not_create_predictions():
+    ev = app.make_event("BTC-USD", "1h", "Bullish Breakout", "Potential", "bull",
+                        pd.Timestamp("2024-01-01 10:00"), 100, 0.5, "1h candle", "potential", False)
+    alert_id = app.try_register_alert(ev, 0)
+    assert app.record_prediction(alert_id, ev, "1h", app.load_settings()) is None
+    assert app.db_query("SELECT COUNT(*) FROM predictions")[0][0] == 0
+
+
+def test_evaluator_marks_long_success_and_notifies_only_once(monkeypatch):
+    set_telegram(monkeypatch)
+    ev = confirmed_prediction_event(ts="2024-01-01 10:00")
+    alert_id = app.try_register_alert(ev, 0)
+    pred_id = app.record_prediction(alert_id, ev, "1h", app.load_settings())
+    app.mark_prediction_telegram_sent(pred_id)
+    idx = pd.date_range("2024-01-01 10:00", periods=6, freq="1h")
+    prices = [100.0, 100.1, 100.2, 100.3, 101.0, 101.1]
+    df = pd.DataFrame({"Open": prices, "High": np.array(prices) + 0.2,
+                       "Low": np.array(prices) - 0.2, "Close": prices,
+                       "Volume": np.full(6, 1000.0)}, index=idx)
+    monkeypatch.setattr(app, "fetch_candles", lambda symbol, tf: app.FetchResult(df, None, app.utc_now()))
+    fixed_now(monkeypatch, "2024-01-01 16:00")
+    messages = []
+    monkeypatch.setattr(app, "tg_send_message", lambda text, chat_id=None: messages.append(text) or (True, {}))
+    assert app.evaluate_due_predictions() == 1
+    row = app.db_query("SELECT outcome, return_pct, result_notified FROM predictions")[0]
+    assert row[0] == "SUCCESS" and row[1] == pytest.approx(1.0) and row[2] == 1
+    assert len(messages) == 1 and "Prediction result: SUCCESS" in messages[0]
+    assert app.evaluate_due_predictions() == 0
+    assert len(messages) == 1
+
+
+def test_short_outcome_and_neutral_threshold():
+    assert app._prediction_outcome("bear", -0.5, 0.25) == "SUCCESS"
+    assert app._prediction_outcome("bear", 0.5, 0.25) == "FAILED"
+    assert app._prediction_outcome("bull", 0.1, 0.25) == "NEUTRAL"
+
+
+def test_stats_command_groups_by_pattern_and_timeframe(monkeypatch):
+    set_telegram(monkeypatch)
+    for tf, side, pattern, outcome in [("1h", "bull", "Bullish Breakout", "SUCCESS"),
+                                      ("1h", "bear", "Bearish Breakdown", "FAILED"),
+                                      ("4h", "bull", "Bullish Breakout", "SUCCESS")]:
+        ev = app.make_event("BTC-USD", tf, pattern, "Confirmed", side, pd.Timestamp("2024-01-01 10:00"),
+                            100.0, 0.5, f"{tf} candle", "test", True)
+        alert_id = app.try_register_alert(ev, 0)
+        app.record_prediction(alert_id, ev, tf, app.load_settings())
+        app.db_execute("UPDATE predictions SET outcome=?, evaluated_at=? WHERE alert_id=?",
+                       (outcome, "2024-01-02 00:00:00", alert_id))
+    assert "66.7%" in app.cmd_stats()
+    assert "Bullish Breakout" in app.cmd_stats(mode="patterns")
+    assert "1h" in app.cmd_stats(mode="timeframes")
+    assert "1h / Bullish Breakout" in app.cmd_stats(mode="detailed")
+
+
+def test_stats_telegram_command(monkeypatch):
+    set_telegram(monkeypatch)
+    (_, reply), = run_command(monkeypatch, "/stats patterns")
+    assert "Prediction statistics" in reply and "No evaluated predictions yet" in reply
+
+
+def test_streamlit_secrets_are_read_when_env_is_empty(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    fake_streamlit = type("FakeStreamlit", (), {"secrets": {"TELEGRAM_BOT_TOKEN": "123:ABC", "TELEGRAM_CHAT_ID": "555"}})()
+    monkeypatch.setattr(app, "st", fake_streamlit)
+    assert app.tg_token() == "123:ABC"
+    assert app.tg_chat_id() == "555"
+    assert app.telegram_configured()
+
+
+def test_prediction_keeps_neutral_threshold_from_signal_time():
+    ev = confirmed_prediction_event()
+    alert_id = app.try_register_alert(ev, 0)
+    app.record_prediction(alert_id, ev, "1h", {**app.load_settings(), "prediction_neutral_pct": 0.25})
+    row = app.db_query("SELECT neutral_pct FROM predictions WHERE alert_id=?", (alert_id,))[0]
+    assert row[0] == pytest.approx(0.25)
+    # Changing the dashboard setting later does not rewrite this prediction's evaluation rule.
+    assert app._prediction_outcome("bull", 0.5, row[0]) == "SUCCESS"
