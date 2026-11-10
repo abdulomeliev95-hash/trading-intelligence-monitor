@@ -6,3 +6,4 @@ plotly>=5.24.1,<6
 kaleido==0.2.1
 python-dotenv>=1.0
 requests>=2.31
+psycopg[binary]>=3.2,<4
