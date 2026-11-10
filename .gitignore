@@ -1,0 +1,27 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+
+# App data (keep the folders, ignore their contents)
+data/*
+charts/*
+!data/.gitkeep
+!charts/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+# Cache
+.pytest_cache/
+.streamlit/cache/
