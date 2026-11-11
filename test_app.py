@@ -792,7 +792,12 @@ def test_bot_token_never_appears_in_errors(monkeypatch):
 
 def run_command(monkeypatch, text, chat_id="555"):
     replies = []
-    monkeypatch.setattr(app, "tg_send_message", lambda t, chat_id=None: replies.append((chat_id, t)) or (True, {}))
+    def fake_send(t, chat_id=None, reply_markup=None):
+        replies.append((chat_id, t))
+        run_command.last_reply_markup = reply_markup
+        return True, {}
+    run_command.last_reply_markup = None
+    monkeypatch.setattr(app, "tg_send_message", fake_send)
     app.handle_update({"update_id": 1, "message": {"text": text, "chat": {"id": int(chat_id)}}})
     return replies
 
@@ -1446,3 +1451,106 @@ def test_prediction_keeps_neutral_threshold_from_signal_time():
     assert row[0] == pytest.approx(0.25)
     # Changing the dashboard setting later does not rewrite this prediction's evaluation rule.
     assert app._prediction_outcome("bull", 0.5, row[0]) == "SUCCESS"
+
+
+def test_prediction_pnl_is_direction_aware():
+    assert app.prediction_pnl_pct("bull", 1.25) == pytest.approx(1.25)
+    assert app.prediction_pnl_pct("bear", -1.25) == pytest.approx(1.25)
+    assert app.prediction_pnl_pct("bear", 1.25) == pytest.approx(-1.25)
+    assert app.prediction_pnl_pct("bull", None) is None
+
+
+def test_prediction_history_includes_pending_and_evaluated_rows():
+    bull = confirmed_prediction_event(direction="bull", ts="2024-01-01 10:00")
+    bear = confirmed_prediction_event(direction="bear", ts="2024-01-01 11:00")
+    bear["asset"] = "AAPL"
+    bull_id = app.try_register_alert(bull, 0)
+    bear_id = app.try_register_alert(bear, 0)
+    app.record_prediction(bull_id, bull, "1h", app.load_settings())
+    app.record_prediction(bear_id, bear, "1h", app.load_settings())
+    app.db_execute("UPDATE predictions SET outcome=?, return_pct=?, exit_price=? WHERE alert_id=?",
+                   ("SUCCESS", -1.5, 98.5, bear_id))
+
+    rows = app.get_predictions(limit=10)
+    assert len(rows) == 2
+    short_row = rows[rows["asset"] == "AAPL"].iloc[0]
+    assert short_row["outcome"] == "SUCCESS"
+    assert app.prediction_pnl_pct(short_row["direction"], short_row["return_pct"]) == pytest.approx(1.5)
+    assert rows[rows["asset"] == "BTC-USD"].iloc[0]["outcome"] is None
+    assert "Synthetic confirmed test signal" in short_row["description"]
+
+
+def test_prediction_history_filters_and_sorts_by_directional_pnl():
+    cases = [
+        ("AAPL", "bull", "Bullish Breakout", 0.6),
+        ("MSFT", "bear", "Bearish Breakdown", -2.1),
+        ("NVDA", "bull", "Bullish Breakout", -0.4),
+    ]
+    for i, (asset, side, pattern, raw_change) in enumerate(cases):
+        ev = app.make_event(asset, "1h", pattern, "Confirmed", side,
+                            pd.Timestamp("2024-01-01 10:00") + pd.Timedelta(hours=i),
+                            100.0, 0.5, "1h candle", "test", True)
+        alert_id = app.try_register_alert(ev, 0)
+        app.record_prediction(alert_id, ev, "1h", app.load_settings())
+        app.db_execute("UPDATE predictions SET outcome=?, return_pct=? WHERE alert_id=?",
+                       ("SUCCESS", raw_change, alert_id))
+
+    best = app.get_predictions(limit=10, sort_by="best")
+    worst = app.get_predictions(limit=10, sort_by="worst")
+    bullish = app.get_predictions(limit=10, pattern="Bullish Breakout")
+    assert best.iloc[0]["asset"] == "MSFT"  # a 2.1% fall benefits the SHORT prediction
+    assert worst.iloc[0]["asset"] == "NVDA"
+    assert set(bullish["asset"]) == {"AAPL", "NVDA"}
+
+
+def test_prediction_history_command_shows_pending_and_directional_result():
+    ev = confirmed_prediction_event(direction="bear")
+    ev["asset"] = "AAPL"
+    alert_id = app.try_register_alert(ev, 0)
+    app.record_prediction(alert_id, ev, "1h", app.load_settings())
+    app.db_execute("UPDATE predictions SET outcome=?, return_pct=? WHERE alert_id=?",
+                   ("SUCCESS", -0.8, alert_id))
+    reply = app.cmd_prediction_history()
+    assert "AAPL" in reply and "SHORT" in reply and "+0.80%" in reply and "SUCCESS" in reply
+
+
+def test_underscore_stats_commands_are_supported(monkeypatch):
+    set_telegram(monkeypatch)
+    for tf, pattern, outcome in [("1h", "Bullish Breakout", "SUCCESS"),
+                                 ("4h", "Bearish Breakdown", "FAILED")]:
+        ev = app.make_event("BTC-USD", tf, pattern, "Confirmed", "bull", pd.Timestamp("2024-01-01 10:00"),
+                            100.0, 0.5, f"{tf} candle", "test", True)
+        alert_id = app.try_register_alert(ev, 0)
+        app.record_prediction(alert_id, ev, tf, app.load_settings())
+        app.db_execute("UPDATE predictions SET outcome=? WHERE alert_id=?", (outcome, alert_id))
+    (_, patterns_text), = run_command(monkeypatch, "/stats_patterns")
+    (_, timeframe_text), = run_command(monkeypatch, "/stats_1h")
+    (_, pattern_text), = run_command(monkeypatch, "/stats_pattern_bullish_breakout")
+    assert "Bullish Breakout" in patterns_text
+    assert "1h" in timeframe_text
+    assert "Bullish Breakout" in pattern_text
+
+
+def test_start_includes_mobile_inline_menu(monkeypatch):
+    set_telegram(monkeypatch)
+    run_command(monkeypatch, "/start")
+    keyboard = run_command.last_reply_markup
+    assert keyboard and keyboard["inline_keyboard"]
+    labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+    assert "📊 Statistics" in labels and "📜 Prediction history" in labels
+
+
+def test_telegram_callback_updates_menu_message(monkeypatch):
+    set_telegram(monkeypatch)
+    edited, answered = [], []
+    monkeypatch.setattr(app, "tg_answer_callback_query", lambda callback_id, text=None: answered.append(callback_id) or (True, {}))
+    monkeypatch.setattr(app, "tg_edit_message_text",
+                        lambda text, chat_id, message_id, reply_markup=None:
+                        edited.append((text, chat_id, message_id, reply_markup)) or (True, {}))
+    app.handle_update({"update_id": 5, "callback_query": {
+        "id": "callback-1", "data": "ui:history",
+        "message": {"message_id": 7, "chat": {"id": 555}}
+    }})
+    assert answered == ["callback-1"]
+    assert edited and "Prediction history" in edited[0][0]
+    assert edited[0][1:3] == ("555", 7)

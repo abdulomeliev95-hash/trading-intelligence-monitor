@@ -1138,7 +1138,7 @@ def _prediction_filters(timeframe=None, pattern=None):
         where.append("timeframe=?")
         params.append(timeframe)
     if pattern:
-        where.append("pattern LIKE ?")
+        where.append("LOWER(pattern) LIKE LOWER(?)")
         params.append(f"%{pattern}%")
     return " AND ".join(where), params
 
@@ -1182,6 +1182,39 @@ def cmd_stats(mode="summary", timeframe=None, pattern=None) -> str:
             lines.append(f"• {label}: {rate:.1f}% | {count} total (✅{w} ❌{l} ➖{n})")
     return "\n".join(lines)
 
+
+def cmd_prediction_history(limit=8) -> str:
+    """Compact Telegram view of the latest evaluated and still-pending predictions."""
+    df = get_predictions(limit=limit)
+    if df.empty:
+        return "📜 Prediction history\nNo predictions stored yet. Only confirmed directional signals are tracked."
+    lines = ["📜 Recent prediction history", "P/L is directional and before fees/slippage."]
+    for row in df.itertuples(index=False):
+        side = "LONG" if row.direction == "bull" else "SHORT"
+        if row.outcome is None or pd.isna(row.outcome):
+            result = "⏳ PENDING"
+            pnl_text = "not evaluated yet"
+        else:
+            icon = {"SUCCESS": "✅", "FAILED": "❌", "NEUTRAL": "➖"}.get(row.outcome, "•")
+            result = f"{icon} {row.outcome}"
+            pnl_text = fmt_pct(prediction_pnl_pct(row.direction, row.return_pct))
+        lines.append(f"\n{row.asset} | {side} | {row.timeframe}")
+        lines.append(f"{row.pattern} — {result} | directional P/L {pnl_text}")
+        lines.append(f"Entry {fmt_price(row.entry_price)} | horizon {row.horizon_minutes} min")
+    return "\n".join(lines)[:3900]
+
+
+def _pattern_command_slug(pattern: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(pattern).lower()).strip("_")
+
+
+def _pattern_from_command_slug(slug: str) -> str:
+    rows = db_query("SELECT DISTINCT pattern FROM predictions ORDER BY pattern")
+    for row in rows:
+        if _pattern_command_slug(row[0]) == slug:
+            return row[0]
+    return slug.replace("_", " ")
+
 def try_register_alert(ev: dict, cooldown_min: int) -> Optional[int]:
     """Store the alert unless it is a duplicate or inside the cooldown. Returns the new id or None.
     - duplicate = same asset, type, timeframe, status and candle time already stored
@@ -1221,6 +1254,65 @@ def get_alerts(limit=200, asset=None, alert_type=None, since_minutes=None) -> pd
     params.append(limit)
     cols = ["created_at", "asset", "alert_type", "status", "timeframe", "price", "change_pct", "description"]
     return pd.DataFrame(db_query(sql, tuple(params)), columns=cols)
+
+
+PREDICTION_COLUMNS = [
+    "id", "alert_id", "asset", "timeframe", "pattern", "direction", "entry_price",
+    "signal_time", "horizon_minutes", "neutral_pct", "due_at", "telegram_sent",
+    "evaluated_at", "exit_candle_time", "exit_price", "return_pct", "outcome",
+    "result_notified", "description",
+]
+
+
+def prediction_pnl_pct(direction, return_pct):
+    """Directional, unleveraged gross return: LONG benefits from a rise; SHORT from a fall."""
+    if return_pct is None or pd.isna(return_pct):
+        return None
+    value = float(return_pct)
+    return -value if str(direction).lower() == "bear" else value
+
+
+def get_predictions(limit=500, asset=None, timeframe=None, pattern=None, outcome=None,
+                    sort_by="newest") -> pd.DataFrame:
+    """Read prediction history, including pending rows, joined to each alert explanation."""
+    where, params = [], []
+    if asset:
+        where.append("p.asset=?")
+        params.append(asset)
+    if timeframe:
+        where.append("p.timeframe=?")
+        params.append(timeframe)
+    if pattern:
+        where.append("p.pattern=?")
+        params.append(pattern)
+    if outcome == "PENDING":
+        where.append("p.outcome IS NULL")
+    elif outcome:
+        where.append("p.outcome=?")
+        params.append(outcome)
+
+    sort_sql = {
+        "newest": "p.signal_time DESC, p.id DESC",
+        "oldest": "p.signal_time ASC, p.id ASC",
+        "asset": "p.asset ASC, p.signal_time DESC",
+        "pattern": "p.pattern ASC, p.signal_time DESC",
+        "best": "CASE WHEN p.return_pct IS NULL THEN 1 ELSE 0 END ASC, "
+                "(CASE WHEN p.direction='bear' THEN -p.return_pct ELSE p.return_pct END) DESC",
+        "worst": "CASE WHEN p.return_pct IS NULL THEN 1 ELSE 0 END ASC, "
+                 "(CASE WHEN p.direction='bear' THEN -p.return_pct ELSE p.return_pct END) ASC",
+    }.get(sort_by, "p.signal_time DESC, p.id DESC")
+    sql = (
+        "SELECT p.id, p.alert_id, p.asset, p.timeframe, p.pattern, p.direction, p.entry_price, "
+        "p.signal_time, p.horizon_minutes, p.neutral_pct, p.due_at, p.telegram_sent, "
+        "p.evaluated_at, p.exit_candle_time, p.exit_price, p.return_pct, p.outcome, "
+        "p.result_notified, COALESCE(a.description, '') "
+        "FROM predictions p LEFT JOIN alerts a ON a.id=p.alert_id"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY {sort_sql} LIMIT ?"
+    params.append(max(1, min(int(limit), 5000)))
+    return pd.DataFrame(db_query(sql, tuple(params)), columns=PREDICTION_COLUMNS)
 
 
 # =============================================================================
@@ -1395,9 +1487,27 @@ def tg_request(method, *, data=None, files=None, params=None, timeout=20, http="
     return True, payload.get("result")
 
 
-def tg_send_message(text, chat_id=None):
-    return tg_request("sendMessage", data={"chat_id": chat_id or tg_chat_id(), "text": text[:4096],
-                                           "disable_web_page_preview": "true"})
+def tg_send_message(text, chat_id=None, reply_markup=None):
+    data = {"chat_id": chat_id or tg_chat_id(), "text": text[:4096],
+            "disable_web_page_preview": "true"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    return tg_request("sendMessage", data=data)
+
+
+def tg_edit_message_text(text, chat_id, message_id, reply_markup=None):
+    data = {"chat_id": chat_id, "message_id": message_id, "text": text[:4096],
+            "disable_web_page_preview": "true"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    return tg_request("editMessageText", data=data)
+
+
+def tg_answer_callback_query(callback_query_id, text=None):
+    data = {"callback_query_id": callback_query_id}
+    if text:
+        data["text"] = str(text)[:180]
+    return tg_request("answerCallbackQuery", data=data)
 
 
 def tg_send_photo(path, caption, chat_id=None):
@@ -1512,20 +1622,153 @@ def cmd_status() -> str:
         f"Last monitor error: {s['last_error'] or 'none'}",
         "Data: Yahoo Finance via yfinance (not guaranteed real-time)."])
 
+def telegram_main_keyboard():
+    """Small phone-friendly home menu; no command typing is required for common tasks."""
+    return {"inline_keyboard": [
+        [{"text": "📊 Statistics", "callback_data": "ui:stats"},
+         {"text": "📜 Prediction history", "callback_data": "ui:history"}],
+        [{"text": "📋 Watchlist", "callback_data": "ui:watchlist"},
+         {"text": "🔔 Latest alerts", "callback_data": "ui:alerts"}],
+        [{"text": "⚙️ Monitor status", "callback_data": "ui:status"},
+         {"text": "❔ Help", "callback_data": "ui:help"}],
+    ]}
+
+
+def telegram_back_keyboard(target="ui:home"):
+    return {"inline_keyboard": [[{"text": "↩️ Back to menu", "callback_data": target}]]}
+
+
+def telegram_stats_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "📊 Overview", "callback_data": "ui:stats"}],
+        [{"text": "Patterns", "callback_data": "ui:stats_patterns"},
+         {"text": "Timeframes", "callback_data": "ui:stats_timeframes"}],
+        [{"text": "Detailed breakdown", "callback_data": "ui:stats_detailed"}],
+        [{"text": "🏠 Main menu", "callback_data": "ui:home"}],
+    ]}
+
+
+def _button_keyboard(buttons, callback_prefix, footer=True):
+    rows, row = [], []
+    for label, value in buttons:
+        row.append({"text": str(label)[:55], "callback_data": f"{callback_prefix}:{value}"[:64]})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if footer:
+        rows.append([{"text": "🏠 Main menu", "callback_data": "ui:home"}])
+    return {"inline_keyboard": rows}
+
+
 def help_text(chat_id: str, allowed: bool) -> str:
     lines = ["📈 Trading Intelligence Monitor", f"Your chat ID: {chat_id}"]
     if not allowed:
-        lines.append("To receive alerts here, add this chat ID as TELEGRAM_CHAT_ID in Streamlit Cloud → Settings → Secrets "
+        lines.append("To use the bot, add this chat ID as TELEGRAM_CHAT_ID in Streamlit Cloud → Settings → Secrets "
                      "(or to your local .env file), then restart the app.")
-    lines += ["", "Commands:", "/watchlist - assets and last prices", "/alerts - last 5 alerts",
-              "/status - monitor status", "/stats - overall prediction statistics",
-              "/stats patterns - results by pattern", "/stats timeframes - results by timeframe",
-              "/stats detailed - pattern + timeframe", "/stats 1h - one timeframe",
+    lines += ["", "Quick menu: /menu", "Commands:",
+              "/watchlist - assets and last prices", "/alerts - last 5 alerts",
+              "/status - monitor status", "/prediction_history - recent predictions",
+              "/stats - overall prediction statistics", "/stats_patterns - results by pattern",
+              "/stats_timeframes - results by timeframe", "/stats_detailed - pattern + timeframe",
+              "/stats_1h - one timeframe", "/stats_pattern_bullish_breakout - one pattern",
               "/test - send a test notification with a chart", "/help - this message", "", DISCLAIMER]
     return "\n".join(lines)
 
 
+def telegram_callback_view(action: str):
+    """Return text + keyboard for an inline-menu action."""
+    if action == "home":
+        return "📈 Trading Intelligence Monitor\nChoose what you want to view:", telegram_main_keyboard()
+    if action == "stats":
+        return cmd_stats(), telegram_stats_keyboard()
+    if action == "stats_detailed":
+        return cmd_stats(mode="detailed"), telegram_stats_keyboard()
+    if action == "stats_patterns":
+        patterns = [r[0] for r in db_query("SELECT DISTINCT pattern FROM predictions ORDER BY pattern")]
+        if not patterns:
+            return "No prediction patterns yet.", telegram_back_keyboard("ui:stats")
+        return "Choose a pattern to see its completed prediction statistics:", _button_keyboard(
+            [(p, p) for p in patterns[:20]], "pattern")
+    if action == "stats_timeframes":
+        timeframes = [r[0] for r in db_query("SELECT DISTINCT timeframe FROM predictions ORDER BY timeframe")]
+        if not timeframes:
+            return "No prediction timeframes yet.", telegram_back_keyboard("ui:stats")
+        return "Choose a timeframe:", _button_keyboard([(tf, tf) for tf in timeframes], "timeframe")
+    if action == "history":
+        keyboard = {"inline_keyboard": [
+            [{"text": "🔄 Refresh", "callback_data": "ui:history"}],
+            [{"text": "📊 Statistics", "callback_data": "ui:stats"},
+             {"text": "🏠 Main menu", "callback_data": "ui:home"}],
+        ]}
+        return cmd_prediction_history(8), keyboard
+    if action == "watchlist":
+        return cmd_watchlist(), telegram_back_keyboard()
+    if action == "alerts":
+        return cmd_alerts(), telegram_back_keyboard()
+    if action == "status":
+        return cmd_status(), telegram_back_keyboard()
+    if action == "help":
+        return help_text(tg_chat_id(), True), telegram_back_keyboard()
+    if action.startswith("pattern:"):
+        return cmd_stats(pattern=action.split(":", 1)[1]), telegram_back_keyboard("ui:stats_patterns")
+    if action.startswith("timeframe:"):
+        return cmd_stats(timeframe=action.split(":", 1)[1]), telegram_back_keyboard("ui:stats_timeframes")
+    return "Unknown menu action. Send /menu to reopen the menu.", telegram_back_keyboard()
+
+
+def handle_callback_query(callback: dict):
+    callback_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+    message_id = message.get("message_id")
+    action = callback.get("data", "")
+    if not chat_id or not callback_id:
+        return
+    if chat_id != tg_chat_id():
+        tg_answer_callback_query(callback_id, "This bot is not authorised for this chat.")
+        return
+    tg_answer_callback_query(callback_id)
+    if action.startswith("ui:"):
+        action = action.split(":", 1)[1]
+    text, keyboard = telegram_callback_view(action)
+    ok, _ = tg_edit_message_text(text, chat_id, message_id, keyboard) if message_id else (False, None)
+    if not ok:
+        tg_send_message(text, chat_id, reply_markup=keyboard)
+
+
+def _stats_reply_for_command(command: str, text: str) -> str:
+    """Accept underscore aliases while retaining the original space-separated syntax."""
+    if command == "/stats_patterns":
+        return cmd_stats(mode="patterns")
+    if command == "/stats_timeframes":
+        return cmd_stats(mode="timeframes")
+    if command == "/stats_detailed":
+        return cmd_stats(mode="detailed")
+    if command.startswith("/stats_pattern_"):
+        slug = command[len("/stats_pattern_"):]
+        return cmd_stats(pattern=_pattern_from_command_slug(slug))
+    if command.startswith("/stats_") and command[len("/stats_"):] in TIMEFRAMES:
+        return cmd_stats(timeframe=command[len("/stats_"):])
+    args = text.split()[1:]
+    if not args:
+        return cmd_stats()
+    if args[0].lower() in ("patterns", "timeframes", "detailed"):
+        return cmd_stats(mode=args[0].lower())
+    if args[0].lower() in TIMEFRAMES:
+        return cmd_stats(timeframe=args[0].lower())
+    if args[0].lower() == "pattern" and len(args) > 1:
+        return cmd_stats(pattern=" ".join(args[1:]))
+    return ("Usage: /stats | /stats_patterns | /stats_timeframes | /stats_detailed | "
+            "/stats_1h | /stats_pattern_bullish_breakout")
+
+
 def handle_update(update: dict):
+    callback = update.get("callback_query")
+    if callback:
+        handle_callback_query(callback)
+        return
     msg = update.get("message") or {}
     text = (msg.get("text") or "").strip()
     chat_id = str((msg.get("chat") or {}).get("id", ""))
@@ -1533,8 +1776,11 @@ def handle_update(update: dict):
         return
     command = text.split()[0].split("@")[0].lower()
     allowed = chat_id == tg_chat_id()
-    if command in ("/start", "/help"):
+    reply_markup = None
+    if command in ("/start", "/help", "/menu"):
         reply = help_text(chat_id, allowed)
+        if allowed:
+            reply_markup = telegram_main_keyboard()
     elif not allowed:
         reply = ("This chat is not authorised. Put this chat ID in TELEGRAM_CHAT_ID in your .env file "
                  f"and restart the app: {chat_id}")
@@ -1544,41 +1790,55 @@ def handle_update(update: dict):
         reply = cmd_alerts()
     elif command == "/status":
         reply = cmd_status()
-    elif command == "/stats":
-        args = text.split()[1:]
-        if not args:
-            reply = cmd_stats()
-        elif args[0].lower() in ("patterns", "timeframes", "detailed"):
-            reply = cmd_stats(mode=args[0].lower())
-        elif args[0].lower() in TIMEFRAMES:
-            reply = cmd_stats(timeframe=args[0].lower())
-        elif args[0].lower() == "pattern" and len(args) > 1:
-            reply = cmd_stats(pattern=" ".join(args[1:]))
-        else:
-            reply = "Usage: /stats | /stats 1h | /stats patterns | /stats timeframes | /stats detailed | /stats pattern Bullish Breakout"
+    elif command in ("/stats", "/stats_patterns", "/stats_timeframes", "/stats_detailed") \
+            or command.startswith("/stats_"):
+        reply = _stats_reply_for_command(command, text)
+    elif command in ("/prediction_history", "/predictions"):
+        reply = cmd_prediction_history()
     elif command == "/test":
         ok, info = send_test_notification(chat_id)
         if ok:
             return
         reply = f"Test failed: {info}"
     else:
-        reply = "Unknown command. Send /help."
-    tg_send_message(reply, chat_id)
+        reply = "Unknown command. Send /menu or /help."
+    tg_send_message(reply, chat_id, reply_markup=reply_markup)
 
 
 def telegram_poll_loop():
     """Background thread: listens for /commands using long polling (getUpdates)."""
     offset = None
+    commands_registered = False
     time.sleep(3)
     while True:
         if not tg_token():
             time.sleep(30)
             continue
+        if not commands_registered:
+            commands = [
+                {"command": "menu", "description": "Open the mobile menu"},
+                {"command": "prediction_history", "description": "Recent predictions and P/L"},
+                {"command": "stats", "description": "Overall prediction statistics"},
+                {"command": "stats_patterns", "description": "Statistics by pattern"},
+                {"command": "stats_timeframes", "description": "Statistics by timeframe"},
+                {"command": "stats_detailed", "description": "Pattern and timeframe breakdown"},
+                {"command": "stats_15m", "description": "Statistics for 15m"},
+                {"command": "stats_1h", "description": "Statistics for 1h"},
+                {"command": "stats_4h", "description": "Statistics for 4h"},
+                {"command": "stats_1d", "description": "Statistics for 1d"},
+                {"command": "stats_pattern_bullish_breakout", "description": "Stats for bullish breakouts"},
+                {"command": "watchlist", "description": "Assets and latest prices"},
+                {"command": "alerts", "description": "Latest alerts"},
+                {"command": "status", "description": "Monitor status"},
+                {"command": "help", "description": "Show help"},
+            ]
+            ok_commands, _ = tg_request("setMyCommands", data={"commands": json.dumps(commands)})
+            commands_registered = bool(ok_commands)
         if offset is None:  # skip old messages that arrived while the app was off
             ok, result = tg_request("getUpdates", params={"timeout": 0}, http="get")
             if ok:
                 offset = result[-1]["update_id"] + 1 if result else 0
-        params = {"timeout": 25, "allowed_updates": json.dumps(["message"])}
+        params = {"timeout": 25, "allowed_updates": json.dumps(["message", "callback_query"])}
         if offset:
             params["offset"] = offset
         ok, result = tg_request("getUpdates", params=params, timeout=40, http="get")
@@ -2016,6 +2276,81 @@ def alerts_fragment():
                  hide_index=True)
 
 
+@st.fragment(run_every=REFRESH_SECONDS)
+def predictions_fragment():
+    """Dedicated, filterable and sortable history of every confirmed directional prediction."""
+    st.subheader("Prediction history")
+    st.caption("This tab includes pending predictions as well as completed ones. Predictions are recorded "
+               "from confirmed directional signals and evaluated after their saved time horizon.")
+    all_rows = get_predictions(limit=5000)
+    if all_rows.empty:
+        st.info("No predictions yet. Once the monitor detects a confirmed directional signal, it will appear here.")
+        st.caption("Potential signals are not counted as predictions. Existing alert history is not deleted.")
+        return
+
+    assets = sorted(all_rows["asset"].dropna().astype(str).unique().tolist())
+    timeframes = [tf for tf in TIMEFRAMES if tf in set(all_rows["timeframe"].dropna())]
+    patterns = sorted(all_rows["pattern"].dropna().astype(str).unique().tolist())
+    filters = st.columns(5)
+    asset = filters[0].selectbox("Asset", ["All"] + assets, key="pred_asset")
+    timeframe = filters[1].selectbox("Timeframe", ["All"] + timeframes, key="pred_timeframe")
+    pattern = filters[2].selectbox("Pattern", ["All"] + patterns, key="pred_pattern")
+    result_label = filters[3].selectbox("Result", ["All", "Pending", "Success", "Failed", "Neutral"],
+                                        key="pred_result")
+    sort_label = filters[4].selectbox(
+        "Sort by", ["Newest first", "Oldest first", "Highest P/L", "Lowest P/L", "Asset A–Z", "Pattern A–Z"],
+        key="pred_sort")
+    limit = st.selectbox("Rows", [50, 100, 200, 500, 1000, 5000], index=2, key="pred_limit")
+    result_value = {"Pending": "PENDING", "Success": "SUCCESS", "Failed": "FAILED", "Neutral": "NEUTRAL"}.get(
+        result_label)
+    sort_value = {"Newest first": "newest", "Oldest first": "oldest", "Highest P/L": "best",
+                  "Lowest P/L": "worst", "Asset A–Z": "asset", "Pattern A–Z": "pattern"}[sort_label]
+    df = get_predictions(limit=limit, asset=None if asset == "All" else asset,
+                         timeframe=None if timeframe == "All" else timeframe,
+                         pattern=None if pattern == "All" else pattern,
+                         outcome=result_value, sort_by=sort_value)
+    if df.empty:
+        st.info("No predictions match these filters.")
+        return
+
+    completed = df[df["outcome"].notna()]
+    wins = int((completed["outcome"] == "SUCCESS").sum())
+    losses = int((completed["outcome"] == "FAILED").sum())
+    neutral = int((completed["outcome"] == "NEUTRAL").sum())
+    decided = wins + losses
+    win_rate = wins / decided * 100 if decided else 0.0
+    metrics = st.columns(5)
+    metrics[0].metric("Predictions", len(df))
+    metrics[1].metric("Pending", int(df["outcome"].isna().sum()))
+    metrics[2].metric("Successful", wins)
+    metrics[3].metric("Failed", losses)
+    metrics[4].metric("Win rate", f"{win_rate:.1f}%" if decided else "n/a")
+
+    table = pd.DataFrame({
+        "Signal time (UTC)": df["signal_time"],
+        "Asset": df["asset"],
+        "Pattern": df["pattern"],
+        "Timeframe": df["timeframe"],
+        "Direction": df["direction"].map({"bull": "LONG", "bear": "SHORT"}),
+        "Entry price": df["entry_price"],
+        "Exit price": df["exit_price"],
+        "Underlying move %": df["return_pct"],
+        "Directional P/L %": [prediction_pnl_pct(d, r) for d, r in zip(df["direction"], df["return_pct"])],
+        "Outcome": df["outcome"].fillna("PENDING"),
+        "Horizon (min)": df["horizon_minutes"],
+        "Evaluation candle (UTC)": df["exit_candle_time"],
+        "Signal explanation": df["description"],
+    })
+    styled = table.style.map(_color_pct, subset=["Underlying move %", "Directional P/L %"]).format(
+        {"Entry price": fmt_price, "Exit price": fmt_price,
+         "Underlying move %": fmt_pct, "Directional P/L %": fmt_pct})
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+    st.caption("Directional P/L is the unleveraged theoretical result from entry to the evaluation candle close: "
+               "LONG = price change; SHORT = the inverse of price change. It excludes commissions, spread, "
+               "slippage, borrow costs and execution constraints. This is a historical signal evaluation, "
+               "not actual account profit or a guarantee of future performance.")
+
+
 def main():
     st.set_page_config(page_title="Trading Intelligence Monitor", page_icon="📈", layout="wide")
     global RT
@@ -2027,13 +2362,16 @@ def main():
     st.caption("Tracks stocks and crypto, detects price moves and basic patterns, and alerts you. "
                "It does NOT trade or manage money. " + DISCLAIMER)
 
-    tab_dash, tab_chart, tab_alerts = st.tabs(["📊 Dashboard", "📈 Chart Analysis", "🔔 Alerts & Patterns"])
+    tab_dash, tab_chart, tab_alerts, tab_predictions = st.tabs(
+        ["📊 Dashboard", "📈 Chart Analysis", "🔔 Alerts & Patterns", "📜 Prediction History"])
     with tab_dash:
         dashboard_fragment()
     with tab_chart:
         chart_analysis()
     with tab_alerts:
         alerts_fragment()
+    with tab_predictions:
+        predictions_fragment()
 
 
 if __name__ == "__main__":
