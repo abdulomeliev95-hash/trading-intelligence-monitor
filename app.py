@@ -231,7 +231,8 @@ def _merge_settings(saved: dict) -> dict:
     if not isinstance(raw_perps, list):
         raw_perps = []
     settings["polymarket_perps"] = [
-        {"instrument_id": int(item["instrument_id"]), "symbol": str(item["symbol"]).strip().upper()}
+        {"instrument_id": int(item["instrument_id"]), "symbol": str(item["symbol"]).strip().upper(),
+         "data_source": "yahoo" if item.get("data_source") == "yahoo" else "polymarket"}
         for item in raw_perps if isinstance(item, dict)
         and str(item.get("instrument_id", "")).isdigit() and item.get("symbol")
     ]
@@ -299,14 +300,36 @@ class FetchResult:
 
 
 def watched_symbols(settings: dict) -> list:
-    """Keep the configured watchlist and Polymarket equity perps as separate sources."""
-    symbols = list(settings.get("watchlist", []))
-    symbols.extend(f"{item['symbol']}-PERP" for item in settings.get("polymarket_perps", []))
+    """Prefer Yahoo symbols; use a Polymarket alias only when Yahoo has no recent data."""
+    perps = {item["symbol"]: item for item in settings.get("polymarket_perps", [])}
+
+    def resolved_symbol(ticker):
+        item = perps.get(ticker)
+        return f"{ticker}-PERP" if item and item.get("data_source") == "polymarket" else ticker
+
+    symbols = [resolved_symbol(symbol) for symbol in settings.get("watchlist", [])]
+    symbols.extend(resolved_symbol(item["symbol"]) for item in perps.values())
     return list(dict.fromkeys(symbols))
 
 
+def _yahoo_has_recent_daily_data(symbol: str) -> Optional[bool]:
+    """Return whether Yahoo has recent daily candles; None means the availability check failed."""
+    try:
+        raw = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=False,
+                                        actions=False, timeout=12)
+        if raw is None or raw.empty:
+            return False
+        latest = pd.Timestamp(raw.index[-1])
+        if latest.tzinfo is not None:
+            latest = latest.tz_convert("UTC").tz_localize(None)
+        return (now_naive_utc().normalize() - latest.normalize()).days <= 7
+    except Exception as exc:
+        log.warning("Could not check Yahoo availability for %s: %s", symbol, redact(exc))
+        return None
+
+
 def refresh_polymarket_perps(settings: dict, force=False) -> dict:
-    """Discover all listed Polymarket equity perps; cache discovery for one hour."""
+    """Discover equity perps and route each ticker to Yahoo when it has recent candles."""
     if RT is None:
         return settings
     now = time.time()
@@ -331,6 +354,23 @@ def refresh_polymarket_perps(settings: dict, force=False) -> dict:
             }
     if not instruments:
         raise ValueError("Polymarket Perps API returned no equity instruments; keeping the last known list.")
+
+    old_sources = {
+        item["symbol"]: item.get("data_source", "polymarket")
+        for item in settings.get("polymarket_perps", [])
+    }
+
+    def resolve_source(item):
+        ticker = item["symbol"]
+        available = _yahoo_has_recent_daily_data(ticker)
+        source = ("yahoo" if available else "polymarket") if available is not None else old_sources.get(ticker, "polymarket")
+        return ticker, source
+
+    with ThreadPoolExecutor(max_workers=SCANNER_MAX_WORKERS, thread_name_prefix="tim-source-check") as pool:
+        sources = dict(pool.map(resolve_source, instruments.values()))
+    for alias, item in instruments.items():
+        item["data_source"] = sources[item["symbol"]]
+
     with RT.cache_lock:
         RT.polymarket_instruments = instruments
         RT.polymarket_instruments_fetched_at = now
