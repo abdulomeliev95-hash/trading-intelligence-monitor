@@ -3,8 +3,11 @@
 All market data below is SYNTHETIC and used only for tests - never for real alerts.
 Yahoo Finance, Telegram and the clock are replaced with fakes, so no internet or token is needed.
 """
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -1207,12 +1210,12 @@ def test_five_minute_alerts_can_be_kept_out_of_telegram(monkeypatch):
     ind = five_min_df(102.5, 2500)
     fixed_now(monkeypatch, ind.index[-1] + pd.Timedelta(minutes=10))
     settings = app.load_settings()
-    settings["telegram_timeframes"] = ["15m", "1h", "4h", "1d", "1w"]
+    settings["telegram_timeframes"] = ["15m", "1h", "4h", "1d"]
     for ev in app.detect_price_events("BTC-USD", ind, settings):
         app.process_event(ev, ind, "5m", settings)
     assert len(app.get_alerts()) == 2 and sent == []         # stored and shown, but not sent
 
-def test_five_minute_alerts_are_sent_by_default(monkeypatch):
+def test_five_minute_alerts_are_not_sent(monkeypatch):
     set_telegram(monkeypatch)
     sent = []
     monkeypatch.setattr(app, "send_alert_notification", lambda ev, ind, tf, chat_id=None: sent.append(tf) or (True, "ok"))
@@ -1221,7 +1224,7 @@ def test_five_minute_alerts_are_sent_by_default(monkeypatch):
     settings = app.load_settings()
     for ev in app.detect_price_events("BTC-USD", ind, settings):
         app.process_event(ev, ind, "5m", settings)
-    assert sent == ["5m", "5m"]
+    assert sent == []
 
 
 def test_long_explanations_keep_the_disclaimer():
@@ -1255,7 +1258,7 @@ def test_telegram_routing_by_timeframe(monkeypatch):
 def test_status_command_shows_telegram_routing(monkeypatch):
     set_telegram(monkeypatch)
     (_, text), = run_command(monkeypatch, "/status")
-    assert "Sent to Telegram: 5m, 15m, 1h, 4h, 1d, 1w" in text
+    assert "Sent to Telegram: 15m, 1h, 4h, 1d" in text
 
 
 def test_double_top_event_carries_its_neckline():
@@ -1554,3 +1557,157 @@ def test_telegram_callback_updates_menu_message(monkeypatch):
     assert answered == ["callback-1"]
     assert edited and "Prediction history" in edited[0][0]
     assert edited[0][1:3] == ("555", 7)
+
+
+# =============================================================================
+# v3 architecture: shared market cache, snapshots, and preserved user settings
+# =============================================================================
+def test_neutral_threshold_default_is_not_changed_by_the_upgrade():
+    assert app.DEFAULT_SETTINGS["prediction_neutral_pct"] == pytest.approx(0.25)
+    settings = app.load_settings()
+    assert settings["prediction_neutral_pct"] == pytest.approx(0.25)
+
+
+def test_fetch_candles_single_flight_shares_one_provider_request(monkeypatch):
+    calls = {"n": 0}
+    source = app.FetchResult(raw_history(), None, app.utc_now())
+    lock = threading.Lock()
+
+    def slow_download(symbol, tf):
+        with lock:
+            calls["n"] += 1
+        time.sleep(0.15)
+        return source
+
+    monkeypatch.setattr(app, "_download", slow_download)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda _: app.fetch_candles("AAPL", "1h"), range(6)))
+    assert calls["n"] == 1
+    assert all(result is source for result in results)
+
+
+def test_indicator_cache_reuses_only_the_same_source_dataframe():
+    first_source = synth(np.linspace(100, 110, 90))
+    first_result = app.FetchResult(first_source, None, app.utc_now())
+    ind1 = app.get_indicators("AAPL", "1h", first_result)
+    ind2 = app.get_indicators("AAPL", "1h", first_result)
+    assert ind1 is ind2
+
+    # A fresh Yahoo response must force a full recalculation, even if the shape is unchanged.
+    second_source = first_source.copy()
+    second_source.iloc[-1, second_source.columns.get_loc("Close")] += 1.0
+    second_result = app.FetchResult(second_source, None, app.utc_now())
+    ind3 = app.get_indicators("AAPL", "1h", second_result)
+    assert ind3 is not ind1
+    assert ind3["Close"].iloc[-1] == pytest.approx(second_source["Close"].iloc[-1])
+
+
+def test_market_snapshot_roundtrip_uses_shared_database():
+    snap = {
+        "asset": "AAPL", "type": "Stock", "error": None, "price": 225.5,
+        "chg_5m": 0.12, "chg_1h": -0.35, "chg_24h": 1.1,
+        "last_candle": pd.Timestamp("2026-11-11 20:00:00"), "age": 3.0,
+        "stale": False, "fetched_at": app.utc_now(),
+    }
+    app.save_market_snapshot(snap)
+    rows = app.get_market_snapshots(["AAPL"])
+    assert rows["AAPL"]["price"] == pytest.approx(225.5)
+    assert rows["AAPL"]["chg_1h"] == pytest.approx(-0.35)
+    assert rows["AAPL"]["stale"] is False
+    assert "MSFT" not in rows
+
+
+def test_worker_status_roundtrip_is_visible_to_web_runtime():
+    app.RT.status.update({
+        "worker_state": "running", "last_cycle": app.utc_now(), "cycles": 7,
+        "cycle_seconds": 12.4, "symbols_scanned": 13,
+    })
+    app.publish_monitor_status()
+    status = app.get_monitor_status()
+    assert status["worker_state"] == "running"
+    assert status["cycles"] == 7
+    assert status["cycle_seconds"] == pytest.approx(12.4)
+    assert status["symbols_scanned"] == 13
+
+
+def test_postgres_queries_use_pool_without_global_db_lock(monkeypatch):
+    class FakeCursor:
+        def __init__(self, rows=None, one=None):
+            self.rows = rows or []
+            self.one = one
+        def fetchall(self):
+            return self.rows
+        def fetchone(self):
+            return self.one
+
+    class FakeConnection:
+        def __init__(self):
+            self.sql = []
+        def execute(self, sql, params=()):
+            self.sql.append((sql, params))
+            if sql.startswith("SELECT value"):
+                return FakeCursor(rows=[("pooled",)])
+            if "RETURNING id" in sql:
+                return FakeCursor(one=(42,))
+            return FakeCursor()
+
+    class FakeConnectionContext:
+        def __init__(self, connection):
+            self.connection_obj = connection
+        def __enter__(self):
+            return self.connection_obj
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakePool:
+        def __init__(self):
+            self.connection_obj = FakeConnection()
+        def connection(self, timeout=None):
+            return FakeConnectionContext(self.connection_obj)
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/test")
+    app.RT.db_pool = FakePool()
+    app.RT.db_pool_url = app.database_url()
+
+    class ForbiddenLock:
+        def __enter__(self):
+            raise AssertionError("PostgreSQL queries must not use the global SQLite lock")
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(app.RT, "db_lock", ForbiddenLock())
+    assert app.db_query("SELECT value FROM demo") == [("pooled",)]
+    assert app.db_execute("INSERT INTO demo (value) VALUES (?)", ("x",)) == 42
+    sent_sql = [sql for sql, _ in app.RT.db_pool.connection_obj.sql]
+    assert any("%s" in sql for sql in sent_sql)
+
+
+def test_get_runtime_does_not_start_background_threads():
+    # Streamlit owns only the UI process; worker.py starts scanner and Telegram polling.
+    before = {thread.name for thread in threading.enumerate()}
+    runtime = app.get_runtime()
+    after = {thread.name for thread in threading.enumerate()}
+    assert isinstance(runtime, app.Runtime)
+    assert not ({"tim-monitor", "tim-telegram"} & (after - before))
+
+
+def test_local_worker_lock_prevents_two_workers(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "DATA_DIR", tmp_path)
+    app.RT = app.Runtime()
+    assert app.acquire_worker_lock() is True
+    first_runtime = app.RT
+
+    app.RT = app.Runtime()
+    assert app.acquire_worker_lock() is False
+
+    app.RT = first_runtime
+    app.release_worker_lock()
+    app.RT = app.Runtime()
+    assert app.acquire_worker_lock() is True
+    app.release_worker_lock()
+
+
+def test_existing_custom_neutral_threshold_is_preserved():
+    app.SETTINGS_PATH.write_text('{"prediction_neutral_pct": 0.8}', encoding="utf-8")
+    settings = app.load_settings()
+    assert settings["prediction_neutral_pct"] == pytest.approx(0.8)

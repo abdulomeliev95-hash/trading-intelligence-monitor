@@ -1,0 +1,7 @@
+# Add these lines to the existing .gitignore if they are not already present:
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+charts/

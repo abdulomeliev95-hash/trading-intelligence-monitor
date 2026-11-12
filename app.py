@@ -6,6 +6,7 @@
 #           6 Database | 7 Charts | 8 Telegram | 9 Background monitor | 10 Web UI
 # =============================================================================
 import inspect
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -46,8 +47,9 @@ log = logging.getLogger("tim")
 DEFAULT_SETTINGS = {
     "watchlist": ["AAPL", "MSFT", "NVDA", "TSLA", "SPY",
                   "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "^GSPC", "^OEX", "AMD", "RKLB"],
+    "polymarket_perps": [],
     "pending_symbols": ["ANT"],
-    "telegram_timeframes": ["5m", "15m", "1h", "4h", "1d", "1w"],   # these go to Telegram; others: history only
+    "telegram_timeframes": ["15m", "1h", "4h", "1d"],
     "crypto_pct": 2.0,       # % change ...
     "crypto_minutes": 5,     # ... within this many minutes
     "stock_pct": 1.0,
@@ -67,11 +69,10 @@ TIMEFRAMES = {
     "1h":  {"interval": "1h",  "period": "60d", "ttl": 300},
     "4h":  {"interval": "1h",  "period": "6mo", "ttl": 600},   # built from 1-hour candles (resample_4h)
     "1d":  {"interval": "1d",  "period": "5y",  "ttl": 900},   # 5 years: more signals for the plan test
-    "1w":  {"interval": "1wk", "period": "5y",  "ttl": 1800},
 }
-INTERVAL_MIN = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080}
+INTERVAL_MIN = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 INTRADAY = {"5m", "15m", "1h", "4h"}
-PATTERN_SCAN_TFS = ["15m", "1h", "4h", "1d"]  # timeframes the background monitor scans for patterns
+PATTERN_SCAN_TFS = ["15m", "1h", "4h", "1d"]  # strategy timeframes; 1m and 5m excluded
 ALERT_TYPES = ["Double Top", "Double Bottom", "Head and Shoulders", "Inverse Head and Shoulders",
                "Change of Character", "Flip Zone Retest"]
 
@@ -104,7 +105,14 @@ RUN_MIN_ATR = 2.0          # the run must be at least 2 ATR to count as a run
 
 MONITOR_INTERVAL_SEC = 60
 REFRESH_SECONDS = 60
+SCANNER_MAX_WORKERS = 3        # deliberately bounded to avoid burst traffic to Yahoo Finance
+DB_POOL_MIN_SIZE = 1
+DB_POOL_MAX_SIZE = 3             # per process; web + worker can use at most six connections combined
+DB_POOL_TIMEOUT_SEC = 10
+WORKER_ADVISORY_LOCK_KEY = 7312042601
 STALE_MIN = {"crypto": 30, "stock": 45}  # data older than this is flagged as stale
+POLYMARKET_PERPS_API = "https://api.perpetuals.polymarket.com"
+POLYMARKET_PERPS_REFRESH_SEC = 3600
 
 UP, DOWN, NEUTRAL = "#26a69a", "#ef5350", "#ffca28"
 DISCLAIMER = "Informational only. Not financial advice. Patterns do not predict future prices."
@@ -159,38 +167,126 @@ class Runtime:
     def __init__(self):
         self.cache = {}
         self.cache_lock = threading.Lock()
-        self.db_lock = threading.Lock()
+        self.fetch_inflight = {}
+        self.indicator_cache = {}
+        self.polymarket_instruments = {}
+        self.polymarket_instruments_fetched_at = 0.0
+        self.db_lock = threading.Lock()          # SQLite only; PostgreSQL uses its connection pool.
+        self.db_pool_lock = threading.Lock()
+        self.db_pool = None
+        self.db_pool_url = None
+        self.worker_lock_connection = None
+        self.worker_lock_file = None
         self.settings_lock = threading.Lock()
+        self.metrics_lock = threading.Lock()
+        self.metrics = {
+            "market_requests": 0, "market_errors": 0, "cache_hits": 0,
+            "cache_misses": 0, "fetch_wait_timeouts": 0,
+            "market_latency_ms_total": 0.0, "db_queries": 0,
+            "db_latency_ms_total": 0.0,
+        }
         self.status = {"started_at": utc_now(), "last_cycle": None, "cycles": 0,
-                       "last_error": None, "telegram_error": None}
+                       "last_error": None, "telegram_error": None,
+                       "cycle_seconds": None, "symbols_scanned": 0}
+        self.stop_event = threading.Event()
+
+
+def _read_settings_file() -> dict:
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        value = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception as exc:
+        log.warning("Could not read settings.json: %s", redact(exc))
+        return {}
+
+
+def _merge_settings(saved: dict) -> dict:
+    settings = json.loads(json.dumps(DEFAULT_SETTINGS))
+    for key in DEFAULT_SETTINGS:
+        if key in saved:
+            settings[key] = saved[key]
+    horizons = dict(DEFAULT_SETTINGS["prediction_horizons_minutes"])
+    if isinstance(settings.get("prediction_horizons_minutes"), dict):
+        horizons.update(settings["prediction_horizons_minutes"])
+    settings["prediction_horizons_minutes"] = {
+        tf: horizons[tf] for tf in DEFAULT_SETTINGS["prediction_horizons_minutes"]
+    }
+    raw_telegram_timeframes = settings.get("telegram_timeframes", [])
+    if not isinstance(raw_telegram_timeframes, list):
+        raw_telegram_timeframes = []
+    settings["telegram_timeframes"] = [
+        tf for tf in raw_telegram_timeframes if tf in PATTERN_SCAN_TFS
+    ]
+    raw_watchlist = settings.get("watchlist", [])
+    if not isinstance(raw_watchlist, list):
+        raw_watchlist = []
+    settings["watchlist"] = [s.strip().upper() for s in raw_watchlist
+                              if isinstance(s, str) and s.strip()] or list(DEFAULT_SETTINGS["watchlist"])
+    raw_pending = settings.get("pending_symbols", [])
+    if not isinstance(raw_pending, list):
+        raw_pending = []
+    settings["pending_symbols"] = [s.strip().upper() for s in raw_pending
+                                    if isinstance(s, str) and s.strip()]
+    raw_perps = settings.get("polymarket_perps", [])
+    if not isinstance(raw_perps, list):
+        raw_perps = []
+    settings["polymarket_perps"] = [
+        {"instrument_id": int(item["instrument_id"]), "symbol": str(item["symbol"]).strip().upper()}
+        for item in raw_perps if isinstance(item, dict)
+        and str(item.get("instrument_id", "")).isdigit() and item.get("symbol")
+    ]
+    if RT is not None and settings["polymarket_perps"]:
+        with RT.cache_lock:
+            RT.polymarket_instruments.update({
+                f"{item['symbol']}-PERP": item for item in settings["polymarket_perps"]
+            })
+    # Do not rewrite the user's neutral movement threshold or reclassify old predictions on startup.
+    return settings
 
 
 def load_settings() -> dict:
-    settings = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
+    """Load shared PostgreSQL settings, or the legacy local JSON file for SQLite installs."""
+    if database_url():
+        rows = db_query("SELECT settings_json FROM app_settings WHERE id=1")
+        if rows:
+            try:
+                saved = json.loads(rows[0][0])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"Shared app_settings row contains invalid JSON: {exc}") from exc
+        else:
+            # On first PostgreSQL startup, seed from an existing local settings.json if present.
+            seed = _read_settings_file() or DEFAULT_SETTINGS
+            seed_text = json.dumps(seed, separators=(",", ":"))
+            db_execute(
+                "INSERT INTO app_settings (id, settings_json, updated_at) VALUES (1, ?, ?) "
+                "ON CONFLICT (id) DO NOTHING",
+                (seed_text, utc_now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            rows = db_query("SELECT settings_json FROM app_settings WHERE id=1")
+            if not rows:
+                raise RuntimeError("Could not initialize shared settings in PostgreSQL.")
+            saved = json.loads(rows[0][0])
+        return _merge_settings(saved if isinstance(saved, dict) else {})
+
     with RT.settings_lock:
-        try:
-            if SETTINGS_PATH.exists():
-                saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-                for key in DEFAULT_SETTINGS:
-                    if key in saved:
-                        settings[key] = saved[key]
-                # Keep new timeframe defaults when an older settings.json stores only some horizons.
-                horizons = dict(DEFAULT_SETTINGS["prediction_horizons_minutes"])
-                horizons.update(settings.get("prediction_horizons_minutes", {}))
-                settings["prediction_horizons_minutes"] = horizons
-                # older versions had a single "telegram_5m" switch: keep the user's choice
-                if "telegram_timeframes" not in saved and saved.get("telegram_5m") is False:
-                    settings["telegram_timeframes"] = [t for t in settings["telegram_timeframes"] if t != "5m"]
-        except Exception as exc:
-            log.warning("Could not read settings.json, using defaults: %s", exc)
-    settings["watchlist"] = [s for s in settings["watchlist"] if isinstance(s, str) and s.strip()] \
-        or list(DEFAULT_SETTINGS["watchlist"])
-    return settings
+        saved = _read_settings_file()
+    return _merge_settings(saved)
+
 
 def save_settings(settings: dict) -> None:
+    clean = _merge_settings(settings)
+    if database_url():
+        db_execute(
+            "INSERT INTO app_settings (id, settings_json, updated_at) VALUES (1, ?, ?) "
+            "ON CONFLICT (id) DO UPDATE SET settings_json=excluded.settings_json, updated_at=excluded.updated_at",
+            (json.dumps(clean, separators=(",", ":")), utc_now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        return
     with RT.settings_lock:
         tmp = SETTINGS_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(clean, indent=2), encoding="utf-8")
         os.replace(tmp, SETTINGS_PATH)
 
 
@@ -202,6 +298,85 @@ class FetchResult:
     df: Optional[pd.DataFrame]
     error: Optional[str]
     fetched_at: datetime
+
+
+def watched_symbols(settings: dict) -> list:
+    """Keep the configured watchlist and Polymarket equity perps as separate sources."""
+    symbols = list(settings.get("watchlist", []))
+    symbols.extend(f"{item['symbol']}-PERP" for item in settings.get("polymarket_perps", []))
+    return list(dict.fromkeys(symbols))
+
+
+def refresh_polymarket_perps(settings: dict, force=False) -> dict:
+    """Discover all listed Polymarket equity perps; cache discovery for one hour."""
+    if RT is None:
+        return settings
+    now = time.time()
+    with RT.cache_lock:
+        if not force and RT.polymarket_instruments and now - RT.polymarket_instruments_fetched_at < POLYMARKET_PERPS_REFRESH_SEC:
+            settings["polymarket_perps"] = list(RT.polymarket_instruments.values())
+            return settings
+    response = requests.get(f"{POLYMARKET_PERPS_API}/v1/info/instruments", timeout=15)
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload if isinstance(payload, list) else payload.get("instruments", payload.get("data", []))
+    instruments = {}
+    for row in rows:
+        if not isinstance(row, dict) or str(row.get("category", "")).lower() != "equity":
+            continue
+        raw_symbol = str(row.get("symbol", row.get("ticker", ""))).upper()
+        ticker = raw_symbol.split("-", 1)[0].strip()
+        instrument_id = row.get("instrument_id", row.get("id"))
+        if ticker and str(instrument_id).isdigit():
+            instruments[f"{ticker}-PERP"] = {
+                "instrument_id": int(instrument_id), "symbol": ticker,
+            }
+    if not instruments:
+        raise ValueError("Polymarket Perps API returned no equity instruments; keeping the last known list.")
+    with RT.cache_lock:
+        RT.polymarket_instruments = instruments
+        RT.polymarket_instruments_fetched_at = now
+    settings["polymarket_perps"] = list(instruments.values())
+    return settings
+
+
+def _download_polymarket_perp(symbol: str, tf: str, instrument: dict) -> FetchResult:
+    """Load Polymarket perpetual candles in the requested native interval."""
+    fetched_at = utc_now()
+    supported = {"5m", "15m", "1h", "4h", "1d"}
+    if tf not in supported:
+        return FetchResult(None, f"Unsupported Polymarket Perps interval: {tf}", fetched_at)
+    days = {"5m": 5, "15m": 30, "1h": 60, "4h": 180, "1d": 1825}[tf]
+    params = {
+        "instrument_id": instrument["instrument_id"],
+        "interval": tf,
+        "start_timestamp": int((time.time() - days * 86400) * 1000),
+        "limit": 5000,
+    }
+    try:
+        response = requests.get(f"{POLYMARKET_PERPS_API}/v1/info/klines", params=params, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        candles = payload.get("klines", payload.get("data", [])) if isinstance(payload, dict) else payload
+        rows = []
+        for candle in candles:
+            if isinstance(candle, dict):
+                ts = candle.get("timestamp", candle.get("t"))
+                values = [candle.get(k) for k in ("open", "high", "low", "close", "volume")]
+            else:
+                ts, *values = candle[:6]
+            if ts is None or len(values) < 5:
+                continue
+            rows.append([pd.to_datetime(int(ts), unit="ms", utc=True).tz_localize(None),
+                         *[float(v) for v in values[:5]]])
+        if not rows:
+            return FetchResult(None, f"No Polymarket Perps candles for {symbol} ({tf}).", fetched_at)
+        df = pd.DataFrame(rows, columns=["Time", "Open", "High", "Low", "Close", "Volume"]).set_index("Time")
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        return FetchResult(df, None, fetched_at)
+    except Exception as exc:
+        return FetchResult(None, f"Polymarket Perps request failed for {symbol} ({tf}): {redact(exc)}", fetched_at)
 
 def resample_4h(df: pd.DataFrame) -> pd.DataFrame:
     """Builds 4-hour candles from 1-hour candles: blocks of 4 consecutive 1h candles inside each UTC day
@@ -217,6 +392,13 @@ def resample_4h(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _download(symbol: str, tf: str) -> FetchResult:
+    instrument = None
+    if RT is not None:
+        instrument = RT.polymarket_instruments.get(symbol)
+    if instrument is None and symbol.endswith("-PERP"):
+        return FetchResult(None, f"Polymarket Perps instrument not loaded for {symbol}.", utc_now())
+    if instrument is not None:
+        return _download_polymarket_perp(symbol, tf, instrument)
     cfg = TIMEFRAMES[tf]
     fetched_at = utc_now()
     try:
@@ -247,18 +429,83 @@ def _download(symbol: str, tf: str) -> FetchResult:
     return FetchResult(df, None, fetched_at)
 
 def fetch_candles(symbol: str, tf: str) -> FetchResult:
-    """Cached download (so the dashboard and the background monitor don't hammer Yahoo)."""
+    """TTL cache with single-flight downloads: concurrent callers share one Yahoo request.
+
+    This does not serve expired/stale candles as fresh data and does not alter OHLCV values.
+    Failed requests are cached only briefly to avoid repeatedly hitting a failing provider.
+    """
     key = (symbol, tf)
     now = time.time()
+    owner = False
     with RT.cache_lock:
         hit = RT.cache.get(key)
         if hit and hit[0] > now:
+            with RT.metrics_lock:
+                RT.metrics["cache_hits"] += 1
             return hit[1]
-    result = _download(symbol, tf)
+        with RT.metrics_lock:
+            RT.metrics["cache_misses"] += 1
+        event = RT.fetch_inflight.get(key)
+        if event is None:
+            event = threading.Event()
+            RT.fetch_inflight[key] = event
+            owner = True
+
+    if not owner:
+        # Wait for the in-flight request instead of making a duplicate provider call.
+        if not event.wait(timeout=65):
+            with RT.metrics_lock:
+                RT.metrics["fetch_wait_timeouts"] += 1
+            return FetchResult(None, f"Timed out waiting for the existing Yahoo Finance request for {symbol} ({tf}).",
+                               utc_now())
+        with RT.cache_lock:
+            hit = RT.cache.get(key)
+            if hit:
+                return hit[1]
+        return FetchResult(None, f"The shared Yahoo Finance request for {symbol} ({tf}) did not return data.",
+                           utc_now())
+
+    started = time.perf_counter()
+    with RT.metrics_lock:
+        RT.metrics["market_requests"] += 1
+    try:
+        result = _download(symbol, tf)
+    except Exception as exc:
+        result = FetchResult(None, f"Yahoo Finance request failed for {symbol} ({tf}): {redact(exc)}", utc_now())
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    with RT.metrics_lock:
+        RT.metrics["market_latency_ms_total"] += elapsed_ms
+        if result.df is None:
+            RT.metrics["market_errors"] += 1
     ttl = TIMEFRAMES[tf]["ttl"] if result.df is not None else 20
     with RT.cache_lock:
-        RT.cache[key] = (now + ttl, result)
+        RT.cache[key] = (time.time() + ttl, result)
+        completed = RT.fetch_inflight.pop(key, None)
+        if completed is not None:
+            completed.set()
     return result
+
+
+def get_indicators(symbol: str, tf: str, result: FetchResult) -> pd.DataFrame:
+    """Reuse indicators only while the exact same raw candle DataFrame is cached.
+
+    Using object identity is intentional: if Yahoo returns a refreshed/corrected history,
+    every indicator is recomputed from that new history rather than reusing an old result.
+    """
+    if result.df is None:
+        raise ValueError(f"No candle data available for {symbol} ({tf}).")
+    key = (symbol, tf)
+    with RT.cache_lock:
+        cached = RT.indicator_cache.get(key)
+        if cached is not None and cached[0] is result.df:
+            return cached[1]
+    indicators = add_indicators(result.df)
+    with RT.cache_lock:
+        RT.indicator_cache[key] = (result.df, indicators)
+        # Keep this cache bounded if symbols/timeframes are changed repeatedly.
+        while len(RT.indicator_cache) > 200:
+            RT.indicator_cache.pop(next(iter(RT.indicator_cache)))
+    return indicators
 
 
 def closed_candles(df: pd.DataFrame, tf: str) -> pd.DataFrame:
@@ -295,12 +542,12 @@ def pct_change_over(df, minutes):
     return price_change(df, minutes)[0]
 
 
-def get_snapshot(symbol: str) -> dict:
-    res = fetch_candles(symbol, "5m")
+def get_snapshot_from_result(symbol: str, res: FetchResult) -> dict:
     crypto = is_crypto(symbol)
     base = {"asset": symbol, "type": "Crypto" if crypto else "Index" if symbol.startswith("^") else "Stock"}
     if res.df is None or res.df.empty:
-        return {**base, "error": res.error or "No data"}
+        return {**base, "error": res.error or "No data", "stale": True,
+                "fetched_at": res.fetched_at}
     df = res.df
     nan = float("nan")
 
@@ -314,6 +561,11 @@ def get_snapshot(symbol: str) -> dict:
             "last_candle": df.index[-1], "age": age,
             "stale": age > STALE_MIN["crypto" if crypto else "stock"],
             "fetched_at": res.fetched_at}
+
+
+def get_snapshot(symbol: str) -> dict:
+    tf = "15m" if symbol.endswith("-PERP") else "5m"
+    return get_snapshot_from_result(symbol, fetch_candles(symbol, tf))
 
 
 # =============================================================================
@@ -732,7 +984,7 @@ def detect_choch(ind, asset, tf, only_last=True, history=HISTORY_SCAN) -> list:
     """Change of Character (CHoCH): an established trend (higher highs + higher lows, or lower highs +
     lower lows) is broken for the FIRST time by a closed candle that closes beyond the last swing low
     (swing high). Each event carries a reference trade plan: entry at the close, hard stop beyond the
-    last swing (+0.25 ATR), target = 1R. Below 4h the signal is only 'Potential' (noise-prone)."""
+    last swing (+0.25 ATR), target = 3R. Signals below 4h are noisier and must be validated in replay."""
     events, n = [], len(ind)
     if n < MIN_CANDLES:
         return events
@@ -764,7 +1016,7 @@ def detect_choch(ind, asset, tf, only_last=True, history=HISTORY_SCAN) -> list:
         if (bearish and stop <= entry) or (not bearish and stop >= entry):
             continue
         risk = abs(stop - entry)
-        target = entry - risk if bearish else entry + risk          # 1R
+        target = entry - 3 * risk if bearish else entry + 3 * risk  # 3R target
         risk_pct = risk / entry * 100
         if bearish:
             what = (f"Uptrend (swing highs {fmt_price(h_old)} -> {fmt_price(h_new)}, swing lows "
@@ -776,15 +1028,14 @@ def detect_choch(ind, asset, tf, only_last=True, history=HISTORY_SCAN) -> list:
                     f"{fmt_price(l_old)} -> {fmt_price(l_new)}) broke: the closed {tf} candle "
                     f"({fmt_ts(ind.index[i])}) finished at {fmt_price(entry)}, above the last lower high "
                     f"{fmt_price(h_new)} - the first close against the trend.")
-        plan_txt = (f" Reference plan (from a published futures test, not advice): entry {fmt_price(entry)}, "
-                    f"hard stop {fmt_price(stop)} beyond the last swing, 1R target {fmt_price(target)} "
+        plan_txt = (f" Paper plan: entry {fmt_price(entry)}, hard stop {fmt_price(stop)} beyond the last swing, "
+                    f"3R target {fmt_price(target)} "
                     f"(risk {risk_pct:.1f}% = {risk / a:.1f} ATR).")
-        note = "" if htf else (f" The {tf} timeframe is below 4h: in that test lower timeframes were much "
-                               f"less reliable (costs and noise).")
+        note = "" if htf else f" {tf} is below 4h and has higher noise; validate in replay."
         events.append(make_event(
-            asset, tf, "Change of Character", "Confirmed" if htf else "Potential",
+            asset, tf, "Change of Character", "Confirmed",
             "bear" if bearish else "bull", ind.index[i], entry, (close[i] / close[i - 1] - 1) * 100,
-            f"{tf} candle", what + plan_txt + note, htf,
+            f"{tf} candle", what + plan_txt + note, True,
             break_distance_atr=(float(abs(entry - (l_new if bearish else h_new)) / a)),
             plan={"entry": entry, "stop": stop, "target": float(target), "risk_pct": risk_pct}))
     return events
@@ -853,10 +1104,11 @@ def add_run_context(ind, ev: dict):
     ev["explanation"] += " - this signal goes the same way (chasing)." if ev["chasing"] else "."
 
 
-def simulate_plan(ind, events, cost_pct=0.0) -> list:
+def simulate_plan(ind, events, cost_pct=0.0, risk_budget_pct=2.0) -> list:
     """Replays events that carry a reference plan. Entry = the signal candle's close. A candle that touches
     the stop counts as a LOSS even if it also reached the target (conservative). Result in R (1R = the
-    initial risk). cost_pct = round-trip cost as % of the entry price, converted to R."""
+    initial risk). cost_pct = round-trip cost as % of the entry price, converted to R.
+    Position sizing risks 2% of starting equity per signal. This is a replay only."""
     high, low = ind["High"].to_numpy(), ind["Low"].to_numpy()
     out = []
     for ev in events:
@@ -873,12 +1125,15 @@ def simulate_plan(ind, events, cost_pct=0.0) -> list:
                 outcome, r = "loss", -1.0
                 break
             if hit_target:
-                outcome, r = "win", 1.0
+                outcome = "win"
+                r = abs(float(plan["target"]) - float(plan["entry"])) / abs(
+                    float(plan["stop"]) - float(plan["entry"]))
                 break
         if outcome != "open":
             r -= cost_pct / plan["risk_pct"]
         out.append({"time": ev["event_time"], "direction": ev["direction"], "entry": plan["entry"],
-                    "stop": plan["stop"], "target": plan["target"], "outcome": outcome, "r": r})
+                    "stop": plan["stop"], "target": plan["target"], "outcome": outcome, "r": r,
+                    "equity_return_pct": r * float(risk_budget_pct)})
     return out
 
 
@@ -912,46 +1167,170 @@ def database_url() -> str:
     return setting_value("DATABASE_URL")
 
 
-def _open_db():
-    """Use PostgreSQL when DATABASE_URL is configured; otherwise use local SQLite."""
+def _get_postgres_pool():
+    """Create/reuse one bounded psycopg pool per process."""
     url = database_url()
-    if url:
+    if not url:
+        return None
+    if RT is None:
+        raise RuntimeError("Runtime is not initialized before using the database.")
+    with RT.db_pool_lock:
+        if RT.db_pool is not None and RT.db_pool_url == url:
+            return RT.db_pool
+        if RT.db_pool is not None:
+            try:
+                RT.db_pool.close()
+            except Exception:
+                log.warning("Could not close the previous PostgreSQL pool.")
         try:
-            import psycopg
+            from psycopg_pool import ConnectionPool
         except ImportError as exc:
-            raise RuntimeError("DATABASE_URL is set, but psycopg is missing. Add psycopg[binary] to requirements.txt.") from exc
-        return psycopg.connect(url), True
-    return sqlite3.connect(DB_PATH, timeout=10), False
+            raise RuntimeError(
+                "DATABASE_URL is set, but psycopg_pool is missing. Install psycopg[pool,binary]>=3.2,<4."
+            ) from exc
+        pool = ConnectionPool(
+            conninfo=url,
+            min_size=DB_POOL_MIN_SIZE,
+            max_size=DB_POOL_MAX_SIZE,
+            timeout=DB_POOL_TIMEOUT_SEC,
+            open=True,
+            name=f"tim-{os.getpid()}",
+        )
+        try:
+            pool.wait(timeout=DB_POOL_TIMEOUT_SEC)
+        except Exception:
+            pool.close()
+            raise
+        RT.db_pool = pool
+        RT.db_pool_url = url
+        return pool
+
+
+def close_database_pool() -> None:
+    if RT is None:
+        return
+    with RT.db_pool_lock:
+        if RT.db_pool is not None:
+            RT.db_pool.close()
+            RT.db_pool = None
+            RT.db_pool_url = None
 
 
 def _db_sql(sql: str, is_postgres: bool) -> str:
     return sql.replace("?", "%s") if is_postgres else sql
 
 
+def _record_db_metric(started: float) -> None:
+    if RT is None:
+        return
+    with RT.metrics_lock:
+        RT.metrics["db_queries"] += 1
+        RT.metrics["db_latency_ms_total"] += (time.perf_counter() - started) * 1000.0
+
+
 def db_query(sql, params=()):
-    with RT.db_lock:
-        con, is_postgres = _open_db()
+    started = time.perf_counter()
+    if database_url():
+        pool = _get_postgres_pool()
         try:
-            cur = con.execute(_db_sql(sql, is_postgres), params)
+            with pool.connection(timeout=DB_POOL_TIMEOUT_SEC) as con:
+                cur = con.execute(_db_sql(sql, True), params)
+                return [tuple(row) for row in cur.fetchall()]
+        finally:
+            _record_db_metric(started)
+    with RT.db_lock:
+        con = sqlite3.connect(DB_PATH, timeout=10)
+        try:
+            cur = con.execute(sql, params)
             return [tuple(row) for row in cur.fetchall()]
         finally:
             con.close()
+            _record_db_metric(started)
 
 
 def db_execute(sql, params=()):
-    with RT.db_lock:
-        con, is_postgres = _open_db()
+    started = time.perf_counter()
+    if database_url():
+        pool = _get_postgres_pool()
         try:
-            with con:
-                query = _db_sql(sql, is_postgres)
-                if is_postgres and query.lstrip().upper().startswith("INSERT") and "RETURNING" not in query.upper():
-                    cur = con.execute(query.rstrip().rstrip(";") + " RETURNING id", params)
-                    row = cur.fetchone()
-                    return row[0] if row else None
-                cur = con.execute(query, params)
-                return cur.lastrowid if not is_postgres else None
+            with pool.connection(timeout=DB_POOL_TIMEOUT_SEC) as con:
+                query = _db_sql(sql, True)
+                if query.lstrip().upper().startswith("INSERT") and "RETURNING" not in query.upper():
+                    target = re.search(r"INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)", query, re.IGNORECASE)
+                    table_name = target.group(1).lower() if target else ""
+                    if table_name != "market_snapshots":
+                        cur = con.execute(query.rstrip().rstrip(";") + " RETURNING id", params)
+                        row = cur.fetchone()
+                        return row[0] if row else None
+                con.execute(query, params)
+                return None
+        finally:
+            _record_db_metric(started)
+    with RT.db_lock:
+        con = sqlite3.connect(DB_PATH, timeout=10)
+        try:
+            cur = con.execute(sql, params)
+            con.commit()
+            return cur.lastrowid
         finally:
             con.close()
+            _record_db_metric(started)
+
+
+def acquire_worker_lock() -> bool:
+    """Ensure only one worker instance scans and long-polls Telegram at a time."""
+    if database_url():
+        pool = _get_postgres_pool()
+        con = pool.getconn(timeout=DB_POOL_TIMEOUT_SEC)
+        try:
+            acquired = bool(con.execute("SELECT pg_try_advisory_lock(%s)", (WORKER_ADVISORY_LOCK_KEY,)).fetchone()[0])
+            con.commit()
+        except Exception:
+            pool.putconn(con)
+            raise
+        if acquired:
+            RT.worker_lock_connection = con  # hold this session until graceful shutdown
+            return True
+        pool.putconn(con)
+        return False
+
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError("The local SQLite worker lock currently requires a POSIX system (macOS/Linux).") from exc
+    lock_file = (DATA_DIR / "worker.lock").open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return False
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    RT.worker_lock_file = lock_file
+    return True
+
+
+def release_worker_lock() -> None:
+    if RT is None:
+        return
+    if RT.worker_lock_connection is not None:
+        con = RT.worker_lock_connection
+        RT.worker_lock_connection = None
+        try:
+            con.execute("SELECT pg_advisory_unlock(%s)", (WORKER_ADVISORY_LOCK_KEY,))
+            con.commit()
+        finally:
+            if RT.db_pool is not None:
+                RT.db_pool.putconn(con)
+    if RT.worker_lock_file is not None:
+        try:
+            import fcntl
+            fcntl.flock(RT.worker_lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            RT.worker_lock_file.close()
+            RT.worker_lock_file = None
 
 
 def init_db():
@@ -1022,6 +1401,98 @@ def init_db():
     db_execute(predictions_sql)
     db_execute("CREATE INDEX IF NOT EXISTS idx_predictions_due ON predictions (outcome, due_at)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_predictions_stats ON predictions (timeframe, pattern, outcome)")
+    if database_url():
+        db_execute("CREATE TABLE IF NOT EXISTS app_settings (id INTEGER PRIMARY KEY, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        db_execute("CREATE TABLE IF NOT EXISTS monitor_status (id INTEGER PRIMARY KEY, status_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        db_execute("""CREATE TABLE IF NOT EXISTS market_snapshots (
+            asset TEXT PRIMARY KEY, asset_type TEXT NOT NULL, price DOUBLE PRECISION,
+            chg_5m DOUBLE PRECISION, chg_1h DOUBLE PRECISION, chg_24h DOUBLE PRECISION,
+            last_candle TEXT, age_minutes DOUBLE PRECISION, stale INTEGER NOT NULL DEFAULT 1,
+            error TEXT, fetched_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    else:
+        db_execute("CREATE TABLE IF NOT EXISTS app_settings (id INTEGER PRIMARY KEY, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        db_execute("CREATE TABLE IF NOT EXISTS monitor_status (id INTEGER PRIMARY KEY, status_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        db_execute("""CREATE TABLE IF NOT EXISTS market_snapshots (
+            asset TEXT PRIMARY KEY, asset_type TEXT NOT NULL, price REAL,
+            chg_5m REAL, chg_1h REAL, chg_24h REAL,
+            last_candle TEXT, age_minutes REAL, stale INTEGER NOT NULL DEFAULT 1,
+            error TEXT, fetched_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    db_execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_updated ON market_snapshots (updated_at)")
+
+
+def _json_safe_status() -> dict:
+    payload = dict(RT.status)
+    payload["started_at"] = payload["started_at"].isoformat() if isinstance(payload.get("started_at"), datetime) else payload.get("started_at")
+    payload["last_cycle"] = payload["last_cycle"].isoformat() if isinstance(payload.get("last_cycle"), datetime) else payload.get("last_cycle")
+    payload["metrics"] = dict(RT.metrics)
+    payload["pid"] = os.getpid()
+    return payload
+
+
+def publish_monitor_status() -> None:
+    """Publish worker heartbeat and performance counters for the separate web process."""
+    payload = json.dumps(_json_safe_status(), separators=(",", ":"))
+    db_execute(
+        "INSERT INTO monitor_status (id, status_json, updated_at) VALUES (1, ?, ?) "
+        "ON CONFLICT (id) DO UPDATE SET status_json=excluded.status_json, updated_at=excluded.updated_at",
+        (payload, utc_now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def get_monitor_status() -> dict:
+    fallback = _json_safe_status() if RT is not None else {}
+    try:
+        rows = db_query("SELECT status_json, updated_at FROM monitor_status WHERE id=1")
+        if rows:
+            payload = json.loads(rows[0][0])
+            payload["updated_at"] = rows[0][1]
+            return payload
+    except Exception as exc:
+        log.warning("Could not read monitor status: %s", redact(exc))
+    return fallback
+
+
+def save_market_snapshot(snapshot: dict) -> None:
+    """Persist the exact 5-minute Yahoo snapshot so the web process need not re-fetch it."""
+    values = (
+        snapshot["asset"], snapshot["type"], snapshot.get("price"), snapshot.get("chg_5m"),
+        snapshot.get("chg_1h"), snapshot.get("chg_24h"),
+        pd.Timestamp(snapshot["last_candle"]).strftime("%Y-%m-%d %H:%M:%S") if snapshot.get("last_candle") is not None else None,
+        snapshot.get("age"), 1 if snapshot.get("stale", True) else 0, snapshot.get("error"),
+        snapshot.get("fetched_at").strftime("%Y-%m-%d %H:%M:%S") if snapshot.get("fetched_at") else utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+        utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    db_execute(
+        "INSERT INTO market_snapshots (asset, asset_type, price, chg_5m, chg_1h, chg_24h, last_candle, age_minutes, stale, error, fetched_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (asset) DO UPDATE SET asset_type=excluded.asset_type, price=excluded.price, "
+        "chg_5m=excluded.chg_5m, chg_1h=excluded.chg_1h, chg_24h=excluded.chg_24h, "
+        "last_candle=excluded.last_candle, age_minutes=excluded.age_minutes, stale=excluded.stale, "
+        "error=excluded.error, fetched_at=excluded.fetched_at, updated_at=excluded.updated_at",
+        values,
+    )
+
+
+def get_market_snapshots(symbols: list[str]) -> dict:
+    if not symbols:
+        return {}
+    placeholders = ",".join("?" for _ in symbols)
+    rows = db_query(
+        "SELECT asset, asset_type, price, chg_5m, chg_1h, chg_24h, last_candle, age_minutes, stale, error, fetched_at, updated_at "
+        f"FROM market_snapshots WHERE asset IN ({placeholders})", tuple(symbols))
+    result = {}
+    for row in rows:
+        (asset, asset_type, price, chg_5m, chg_1h, chg_24h, last_candle, age, stale,
+         error, fetched_at, updated_at) = row
+        result[asset] = {
+            "asset": asset, "type": asset_type, "price": price, "chg_5m": chg_5m,
+            "chg_1h": chg_1h, "chg_24h": chg_24h,
+            "last_candle": pd.Timestamp(last_candle) if last_candle else None,
+            "age": age, "stale": bool(stale), "error": error,
+            "fetched_at": pd.Timestamp(fetched_at) if fetched_at else None,
+            "updated_at": pd.Timestamp(updated_at) if updated_at else None,
+        }
+    return result
 
 
 def prediction_horizon(tf: str, settings: dict) -> int:
@@ -1270,6 +1741,20 @@ def prediction_pnl_pct(direction, return_pct):
         return None
     value = float(return_pct)
     return -value if str(direction).lower() == "bear" else value
+
+
+def get_prediction_filter_options() -> dict:
+    """Fetch unique filter values using SQL, without loading the full prediction history."""
+    rows = db_query(
+        "SELECT 'asset' AS kind, asset AS value FROM predictions GROUP BY asset "
+        "UNION ALL SELECT 'timeframe', timeframe FROM predictions GROUP BY timeframe "
+        "UNION ALL SELECT 'pattern', pattern FROM predictions GROUP BY pattern ORDER BY kind, value"
+    )
+    options = {"asset": [], "timeframe": [], "pattern": []}
+    for kind, value in rows:
+        if kind in options and value is not None:
+            options[kind].append(str(value))
+    return options
 
 
 def get_predictions(limit=500, asset=None, timeframe=None, pattern=None, outcome=None,
@@ -1582,15 +2067,18 @@ def send_test_notification(chat_id=None):
 
 
 def cmd_watchlist() -> str:
+    symbols = watched_symbols(load_settings())
     lines = ["📋 Watchlist"]
-    for sym in load_settings()["watchlist"]:
-        s = get_snapshot(sym)
-        if s["error"]:
-            lines.append(f"• {sym}: no data")
-        else:
-            lines.append(f"• {sym}: {fmt_price(s['price'])} (24h {fmt_pct(s['chg_24h'])}, "
-                         f"data age {s['age']:.0f} min)")
-    lines.append("Source: Yahoo Finance via yfinance (may be delayed).")
+    if symbols:
+        with ThreadPoolExecutor(max_workers=min(SCANNER_MAX_WORKERS, len(symbols)), thread_name_prefix="tim-watchlist") as pool:
+            snapshots = list(pool.map(get_snapshot, symbols))
+        for sym, s in zip(symbols, snapshots):
+            if s["error"]:
+                lines.append(f"• {sym}: no data")
+            else:
+                lines.append(f"• {sym}: {fmt_price(s['price'])} (24h {fmt_pct(s['chg_24h'])}, "
+                             f"data age {s['age']:.0f} min)")
+    lines.append("Sources: Yahoo Finance for configured assets; Polymarket Perps API for -PERP instruments.")
     return "\n".join(lines)
 
 
@@ -1605,12 +2093,24 @@ def cmd_alerts() -> str:
 
 
 def cmd_status() -> str:
-    s, cfg = RT.status, load_settings()
-    last = s["last_cycle"].strftime("%Y-%m-%d %H:%M:%S") if s["last_cycle"] else "not finished yet"
+    s, cfg = get_monitor_status(), load_settings()
+    last_value = s.get("last_cycle")
+    last = pd.Timestamp(last_value).strftime("%Y-%m-%d %H:%M:%S") if last_value else "not finished yet"
+    metrics = s.get("metrics", {})
+    market_requests = int(metrics.get("market_requests", 0) or 0)
+    db_queries = int(metrics.get("db_queries", 0) or 0)
+    market_avg = (float(metrics.get("market_latency_ms_total", 0.0)) / market_requests) if market_requests else 0.0
+    db_avg = (float(metrics.get("db_latency_ms_total", 0.0)) / db_queries) if db_queries else 0.0
+    cache_lookups = int(metrics.get("cache_hits", 0) or 0) + int(metrics.get("cache_misses", 0) or 0)
+    cache_hit_pct = (100.0 * int(metrics.get("cache_hits", 0) or 0) / cache_lookups) if cache_lookups else 0.0
     return "\n".join([
         "ℹ️ TIM status",
-        f"Monitor last cycle (UTC): {last} (cycles: {s['cycles']})",
-        f"Assets watched: {len(cfg['watchlist'])}",
+        f"Worker state: {s.get('worker_state', 'unknown')}",
+        f"Monitor last cycle (UTC): {last} (cycles: {s.get('cycles', 0)})",
+        f"Last scan: {s.get('cycle_seconds', 'n/a')} sec | assets: {s.get('symbols_scanned', 'n/a')}",
+        f"Market data requests: {market_requests} | avg latency: {market_avg:.0f} ms | cache hit: {cache_hit_pct:.1f}%",
+        f"Database queries: {db_queries} | avg latency: {db_avg:.1f} ms",
+        f"Assets watched: {len(watched_symbols(cfg))}",
         f"Crypto threshold: {cfg['crypto_pct']:g}% / {cfg['crypto_minutes']} min",
         f"Stock threshold: {cfg['stock_pct']:g}% / {cfg['stock_minutes']} min",
         f"Volume spike: {cfg['volume_mult']:g}x | cooldown: {cfg['cooldown_minutes']} min",
@@ -1619,8 +2119,8 @@ def cmd_status() -> str:
         f"Prediction horizons (min): {cfg.get('prediction_horizons_minutes', DEFAULT_SETTINGS['prediction_horizons_minutes'])}",
         f"Neutral threshold: {cfg.get('prediction_neutral_pct', 0.25):g}%",
         f"Database: {'PostgreSQL' if database_url() else 'local SQLite (not durable on ephemeral hosting)'}",
-        f"Last monitor error: {s['last_error'] or 'none'}",
-        "Data: Yahoo Finance via yfinance (not guaranteed real-time)."])
+        f"Last monitor error: {s.get('last_error') or 'none'}",
+        "Data: Yahoo Finance for configured assets; Polymarket Perps API for -PERP instruments."])
 
 def telegram_main_keyboard():
     """Small phone-friendly home menu; no command typing is required for common tasks."""
@@ -1805,14 +2305,16 @@ def handle_update(update: dict):
     tg_send_message(reply, chat_id, reply_markup=reply_markup)
 
 
-def telegram_poll_loop():
-    """Background thread: listens for /commands using long polling (getUpdates)."""
+def telegram_poll_loop(stop_event: Optional[threading.Event] = None):
+    """Worker thread: listens for /commands using long polling (getUpdates)."""
     offset = None
     commands_registered = False
-    time.sleep(3)
-    while True:
+    if _wait_or_stop(stop_event, 3):
+        return
+    while stop_event is None or not stop_event.is_set():
         if not tg_token():
-            time.sleep(30)
+            if _wait_or_stop(stop_event, 30):
+                return
             continue
         if not commands_registered:
             commands = [
@@ -1844,7 +2346,8 @@ def telegram_poll_loop():
         ok, result = tg_request("getUpdates", params=params, timeout=40, http="get")
         if not ok:
             RT.status["telegram_error"] = result
-            time.sleep(15)
+            if _wait_or_stop(stop_event, 15):
+                return
             continue
         RT.status["telegram_error"] = None
         for update in result:
@@ -1893,10 +2396,10 @@ def process_event(ev: dict, ind: pd.DataFrame, tf: str, settings: dict):
     if alert_id is None:
         return  # duplicate or inside cooldown
     log.info("ALERT #%s %s %s (%s, %s)", alert_id, ev["asset"], ev["alert_type"], ev["status"], tf)
-    routed = tf in settings.get("telegram_timeframes", list(TIMEFRAMES))   # timeframe routing
+    routed = tf in PATTERN_SCAN_TFS and tf in settings.get("telegram_timeframes", PATTERN_SCAN_TFS)
     quality_ok = passes_notification_quality(ev, settings)
     prediction_id = None
-    if is_prediction_event(ev) and quality_ok:
+    if is_prediction_event(ev) and quality_ok and tf in PATTERN_SCAN_TFS:
         prediction_id = record_prediction(alert_id, ev, tf, settings)
     if ev["notify"] and quality_ok and routed and telegram_configured():
         ok, info = send_alert_notification(ev, ind, tf)
@@ -1916,15 +2419,23 @@ def process_event(ev: dict, ind: pd.DataFrame, tf: str, settings: dict):
 
 def scan_symbol(symbol: str, settings: dict):
     jobs = []
-    res5 = fetch_candles(symbol, "5m")
-    if res5.df is not None and len(res5.df) >= 2:
-        ind5 = add_indicators(res5.df)
-        jobs.append(("5m", ind5, detect_price_events(symbol, ind5, settings)))
+    is_perps = symbol.endswith("-PERP")
+    snapshot_tf = "15m" if is_perps else "5m"
+    res5 = fetch_candles(symbol, snapshot_tf)
+    try:
+        if res5.df is not None and not res5.df.empty:
+            save_market_snapshot(get_snapshot_from_result(symbol, res5))
+        else:
+            save_market_snapshot({"asset": symbol,
+                                  "type": "Crypto" if is_crypto(symbol) else "Index" if symbol.startswith("^") else "Stock",
+                                  "error": res5.error or "No market data", "stale": True})
+    except Exception as exc:
+        log.warning("Could not publish dashboard snapshot for %s: %s", symbol, redact(exc))
     for tf in PATTERN_SCAN_TFS:
         res = fetch_candles(symbol, tf)
         if res.df is None:
             continue
-        ind = add_indicators(res.df)
+        ind = get_indicators(symbol, tf, res)
         jobs.append((tf, ind, pattern_events(closed_candles(ind, tf), symbol, tf, only_last=True)))
     for tf, ind, events in jobs:
         for ev in events:
@@ -1953,47 +2464,78 @@ def check_pending_symbols(settings: dict):
                             "New listings are very volatile and have almost no history, so indicators "
                             "and patterns appear only after enough candles.\n" + DISCLAIMER)
 
-def monitor_loop():
-    time.sleep(5)
-    log.info("Background monitor started (every %s s).", MONITOR_INTERVAL_SEC)
-    while True:
-        started, errors = time.time(), []
-        try:
-            settings = load_settings()
-            for symbol in settings["watchlist"]:
+def _wait_or_stop(stop_event: Optional[threading.Event], seconds: float) -> bool:
+    if stop_event is None:
+        time.sleep(seconds)
+        return False
+    return stop_event.wait(seconds)
+
+
+def monitor_loop(stop_event: Optional[threading.Event] = None):
+    """Run scanning in the dedicated worker process, never inside the Streamlit server."""
+    stop_event = stop_event or RT.stop_event
+    _wait_or_stop(stop_event, 5)
+    if stop_event.is_set():
+        return
+    RT.status["worker_state"] = "running"
+    publish_monitor_status()
+    log.info("Background worker monitor started (every %s s).", MONITOR_INTERVAL_SEC)
+    with ThreadPoolExecutor(max_workers=SCANNER_MAX_WORKERS, thread_name_prefix="tim-scan") as pool:
+        while not stop_event.is_set():
+            started = time.time()
+            errors = []
+            symbols = []
+            try:
+                settings = load_settings()
+                old_perps = settings.get("polymarket_perps", [])
                 try:
-                    scan_symbol(symbol, settings)
+                    settings = refresh_polymarket_perps(settings)
+                    if settings.get("polymarket_perps") != old_perps:
+                        save_settings(settings)
                 except Exception as exc:
-                    errors.append(f"{symbol}: {redact(exc)}")
-                    log.warning("Scan failed for %s: %s", symbol, redact(exc))
-                time.sleep(0.3)
-            try:
-                check_pending_symbols(settings)
+                    log.warning("Could not refresh Polymarket stock perps: %s", redact(exc))
+                symbols = watched_symbols(settings)
+
+                def scan_one(symbol):
+                    try:
+                        scan_symbol(symbol, settings)
+                        return None
+                    except Exception as exc:
+                        log.warning("Scan failed for %s: %s", symbol, redact(exc))
+                        return f"{symbol}: {redact(exc)}"
+
+                for error in pool.map(scan_one, symbols):
+                    if error:
+                        errors.append(error)
+                try:
+                    check_pending_symbols(settings)
+                except Exception as exc:
+                    errors.append(f"pending symbols: {redact(exc)}")
+                try:
+                    evaluate_due_predictions(settings)
+                except Exception as exc:
+                    errors.append(f"prediction evaluator: {redact(exc)}")
+                RT.status["last_cycle"] = utc_now()
+                RT.status["cycles"] += 1
+                RT.status["symbols_scanned"] = len(symbols)
             except Exception as exc:
-                errors.append(f"pending symbols: {redact(exc)}")
+                errors.append(redact(exc))
+                log.warning("Monitor cycle failed: %s", redact(exc))
+            RT.status["last_error"] = "; ".join(errors[:3]) if errors else None
+            RT.status["cycle_seconds"] = round(time.time() - started, 2)
             try:
-                evaluate_due_predictions(settings)
+                publish_monitor_status()
             except Exception as exc:
-                errors.append(f"prediction evaluator: {redact(exc)}")
-            RT.status["last_cycle"] = utc_now()
-            RT.status["cycles"] += 1
-        except Exception as exc:
-            errors.append(redact(exc))
-            log.warning("Monitor cycle failed: %s", redact(exc))
-        RT.status["last_error"] = "; ".join(errors[:3]) if errors else None
-        time.sleep(max(5.0, MONITOR_INTERVAL_SEC - (time.time() - started)))
+                log.warning("Could not publish worker heartbeat: %s", redact(exc))
+            remaining = max(5.0, MONITOR_INTERVAL_SEC - (time.time() - started))
+            if _wait_or_stop(stop_event, remaining):
+                break
+
 
 @st.cache_resource(show_spinner=False)
 def get_runtime() -> Runtime:
-    """Runs once per server process: creates shared state and starts the 2 background threads.
-    NOTE: after you edit app.py, stop (Ctrl+C) and start Streamlit again so the threads reload."""
-    rt = Runtime()
-    names = {t.name for t in threading.enumerate()}
-    if "tim-monitor" not in names:
-        threading.Thread(target=monitor_loop, name="tim-monitor", daemon=True).start()
-    if "tim-telegram" not in names:
-        threading.Thread(target=telegram_poll_loop, name="tim-telegram", daemon=True).start()
-    return rt
+    """Create web-process state only. The worker is started separately with `python worker.py`."""
+    return Runtime()
 
 
 # =============================================================================
@@ -2065,16 +2607,17 @@ def render_sidebar():
         cooldown = st.number_input("Cooldown between repeated alerts (minutes)", 1, 1440,
                                    int(settings["cooldown_minutes"]), 5)
         tg_tfs = st.multiselect(
-            "Send these timeframes to Telegram",
-            list(TIMEFRAMES),
-            default=[t for t in settings.get("telegram_timeframes", list(TIMEFRAMES)) if t in TIMEFRAMES],
-            help="Alerts of the other timeframes are still saved in the history and shown in the app.")
+            "Send these strategy timeframes to Telegram",
+            PATTERN_SCAN_TFS,
+            default=[t for t in settings.get("telegram_timeframes", PATTERN_SCAN_TFS)
+                     if t in PATTERN_SCAN_TFS],
+            help="1m and 5m are excluded. Strategy signals and predictions start at 15m; other detected alerts remain in history.")
         if st.form_submit_button("💾 Save thresholds"):
             settings.update({"crypto_pct": c_pct, "crypto_minutes": int(c_min), "stock_pct": s_pct,
                              "stock_minutes": int(s_min), "volume_mult": v_mult,
                              "min_breakout_atr": min_breakout_atr,
                              "cooldown_minutes": int(cooldown),
-                             "telegram_timeframes": [t for t in TIMEFRAMES if t in tg_tfs]})
+                             "telegram_timeframes": [t for t in PATTERN_SCAN_TFS if t in tg_tfs]})
             save_settings(settings)
             st.success("Saved. The background monitor uses the new values on its next cycle.")
 
@@ -2105,8 +2648,9 @@ def render_sidebar():
                 with st.spinner("Sending..."):
                     ok, info = send_test_notification()
                 (st.success if ok else st.error)(info)
-            if RT.status["telegram_error"]:
-                st.warning(f"Command listener problem: {RT.status['telegram_error']}")
+            monitor_state = get_monitor_status()
+            if monitor_state.get("telegram_error"):
+                st.warning(f"Telegram polling issue: {monitor_state['telegram_error']}")
         else:
             st.warning("Telegram is not configured. The app works without it, but no notifications "
                        "will be sent.")
@@ -2117,37 +2661,75 @@ def render_sidebar():
                 "4. Put that number in `TELEGRAM_CHAT_ID` in `.env` and restart again.\n\n"
                 "Full guide: README.md")
 
-    s = RT.status
-    last = s["last_cycle"].strftime("%H:%M:%S UTC") if s["last_cycle"] else "first cycle running..."
-    sb.caption(f"Background monitor: last cycle {last} | cycles: {s['cycles']}")
-    if s["last_error"]:
+    s = get_monitor_status()
+    last_value = s.get("last_cycle")
+    last = pd.Timestamp(last_value).strftime("%H:%M:%S UTC") if last_value else "no completed cycle yet"
+    worker_fresh = False
+    if last_value:
+        last_ts = pd.Timestamp(last_value)
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        worker_fresh = (s.get("worker_state") == "running" and
+                        (utc_now() - last_ts.to_pydatetime()).total_seconds() <= MONITOR_INTERVAL_SEC * 3)
+    worker_label = "online" if worker_fresh else s.get("worker_state", "not detected")
+    sb.caption(f"Background worker: {worker_label} | last cycle {last} | cycles: {s.get('cycles', 0)}")
+    if s.get("cycle_seconds") is not None:
+        metrics = s.get("metrics", {})
+        request_count = metrics.get("market_requests", 0)
+        hit_count = metrics.get("cache_hits", 0)
+        hit_rate = (100.0 * hit_count / (hit_count + metrics.get("cache_misses", 0))) if (hit_count + metrics.get("cache_misses", 0)) else 0.0
+        market_avg = (metrics.get("market_latency_ms_total", 0.0) / request_count) if request_count else 0.0
+        db_queries = metrics.get("db_queries", 0)
+        db_avg = (metrics.get("db_latency_ms_total", 0.0) / db_queries) if db_queries else 0.0
+        sb.caption(f"Last scan: {s['cycle_seconds']}s | Yahoo avg: {market_avg:.0f}ms | DB avg: {db_avg:.1f}ms | cache: {hit_rate:.1f}%")
+    if s.get("last_error"):
         sb.caption(f"Last monitor error: {s['last_error']}")
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def dashboard_fragment():
     settings = load_settings()
     rows, problems = [], []
-    for sym in settings["watchlist"]:
-        snap = get_snapshot(sym)
+    symbols = watched_symbols(settings)
+    snapshots = get_market_snapshots(symbols)
+    for sym in symbols:
+        snap = snapshots.get(sym)
+        if snap is None:
+            problems.append(f"{sym}: waiting for the background worker to publish its first snapshot")
+            rows.append({"Asset": asset_label(sym), "Type": "Crypto" if is_crypto(sym) else "Index" if sym.startswith("^") else "Stock",
+                         "Price": np.nan, "5m %": np.nan, "1h %": np.nan, "24h %": np.nan,
+                         "Last candle (UTC)": "n/a", "Age (min)": np.nan, "Status": "Waiting for worker"})
+            continue
+        updated_at = snap.get("updated_at")
+        worker_snapshot_age = float("inf")
+        if updated_at is not None:
+            ts = pd.Timestamp(updated_at)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            worker_snapshot_age = max(0.0, (utc_now() - ts.to_pydatetime()).total_seconds())
+        worker_snapshot_stale = worker_snapshot_age > MONITOR_INTERVAL_SEC * 3
         if snap["error"]:
             problems.append(f"{sym}: {snap['error']}")
+        if snap["error"] or snap.get("price") is None:
             rows.append({"Asset": asset_label(sym), "Type": snap["type"], "Price": np.nan, "5m %": np.nan,
                          "1h %": np.nan, "24h %": np.nan, "Last candle (UTC)": "n/a",
                          "Age (min)": np.nan, "Status": "No data"})
         else:
+            state = "Worker snapshot stale" if worker_snapshot_stale else (
+                "Stale (market closed or delayed)" if snap["stale"] else "OK")
             rows.append({"Asset": asset_label(sym), "Type": snap["type"], "Price": snap["price"],
                          "5m %": snap["chg_5m"], "1h %": snap["chg_1h"], "24h %": snap["chg_24h"],
-                         "Last candle (UTC)": fmt_ts(snap["last_candle"]), "Age (min)": snap["age"],
-                         "Status": "Stale (market closed or delayed)" if snap["stale"] else "OK"})
+                         "Last candle (UTC)": fmt_ts(snap["last_candle"]) if snap["last_candle"] is not None else "n/a",
+                         "Age (min)": snap["age"], "Status": state})
 
     recent = get_alerts(since_minutes=60, limit=50)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Assets watched", len(settings["watchlist"]))
+    c1.metric("Assets watched", len(symbols))
     c2.metric("Active alerts (last 60 min)", len(recent))
     c3.metric("Dashboard refreshed (UTC)", utc_now().strftime("%H:%M:%S"))
     st.caption("Data source: Yahoo Finance via yfinance (unofficial feed). Quotes can be delayed or "
-               "incomplete and are NOT guaranteed real-time. 'n/a' means the history does not cover "
-               f"that period. Auto-refresh every {REFRESH_SECONDS} s.")
+               "incomplete and are NOT guaranteed real-time. Dashboard values are published by the "
+               "separate background worker; a stale worker snapshot is explicitly marked. Auto-refresh "
+               f"every {REFRESH_SECONDS} s.")
     pending = settings.get("pending_symbols", [])
     if pending:
         st.info("Waiting for the first trade (will be added automatically): "
@@ -2188,23 +2770,25 @@ def show_backtest(trades: list):
                    "from this alone (30+ trades, ideally on data the idea was not tuned on).")
     table = pd.DataFrame([{"Signal (UTC)": fmt_ts(t["time"]), "Side": "Long" if t["direction"] == "bull" else "Short",
                            "Entry": t["entry"], "Stop": t["stop"], "Target": t["target"],
-                           "Result": t["outcome"], "R (after cost)": t["r"]} for t in trades])
+                           "Result": t["outcome"], "R (after cost)": t["r"],
+                           "Equity change % (2% risk)": t["equity_return_pct"]} for t in trades])
     st.dataframe(table.style.format({"Entry": fmt_price, "Stop": fmt_price, "Target": fmt_price,
-                                     "R (after cost)": "{:+.2f}"}), hide_index=True)
+                                     "R (after cost)": "{:+.2f}",
+                                     "Equity change % (2% risk)": "{:+.2f}%"}), hide_index=True)
 
 
 def chart_analysis():
     settings = load_settings()
     c1, c2, c3 = st.columns([2, 3, 2])
-    symbol = c1.selectbox("Asset", settings["watchlist"], key="chart_symbol")
-    tf = c2.radio("Timeframe", list(TIMEFRAMES), index=2, horizontal=True, key="chart_tf")
+    symbol = c1.selectbox("Asset", watched_symbols(settings), key="chart_symbol")
+    tf = c2.radio("Timeframe", PATTERN_SCAN_TFS, index=1, horizontal=True, key="chart_tf")
     candles = c3.slider("Candles shown", 50, 400, 150, 10, key="chart_candles")
 
     res = fetch_candles(symbol, tf)
     if res.df is None:
         st.warning(res.error)
         return
-    ind = add_indicators(res.df)
+    ind = get_indicators(symbol, tf, res)
     if len(ind) < MIN_CANDLES:
         st.warning(f"Only {len(ind)} candles available for {symbol} ({tf}); at least {MIN_CANDLES} are "
                    f"needed for indicators and pattern detection.")
@@ -2218,7 +2802,8 @@ def chart_analysis():
                 key="main_chart")
 
     last = ind.iloc[-1]
-    st.caption(f"Data source: Yahoo Finance via yfinance. Downloaded {res.fetched_at:%Y-%m-%d %H:%M:%S} UTC | "
+    data_source = "Polymarket Perps API" if symbol.endswith("-PERP") else "Yahoo Finance via yfinance"
+    st.caption(f"Data source: {data_source}. Downloaded {res.fetched_at:%Y-%m-%d %H:%M:%S} UTC | "
                f"last candle {fmt_ts(ind.index[-1])} UTC (may still be forming; patterns use closed "
                f"candles only). Not guaranteed real-time.")
     st.markdown(f"**Indicators (last candle):** {indicator_summary(last)}")
@@ -2235,10 +2820,9 @@ def chart_analysis():
     for f in forming:
         st.warning(f["explanation"])
     with st.expander("🧪 Test the 'Change of Character' plan on this chart's history"):
-        st.caption("Replays every Change of Character signal found in the downloaded history: entry at the "
-                   "signal candle's close, hard stop beyond the last swing, target = 1R. If one candle touches "
-                   "both stop and target it counts as a LOSS (conservative). Yahoo's history is short, so the "
-                   "number of trades is usually small. This tests an idea, it is not a forecast.")
+        st.caption("Paper replay only: entry at signal close, 2% of starting equity at risk per trade, target = 3R. "
+                   "No real orders are sent. If one candle touches both stop and target it counts as a LOSS "
+                   "(conservative). Results omit compounding and depend on candle data quality.")
         cost = st.number_input("Round-trip cost per trade (% of price)", 0.0, 2.0, 0.10, 0.05, key="bt_cost")
         if st.button("Run test", key="bt_run"):
             signals = detect_choch(closed, symbol, tf, only_last=False, history=len(closed))
@@ -2256,12 +2840,12 @@ def chart_analysis():
 def alerts_fragment():
     settings = load_settings()
     st.subheader("Alert history")
-    st.caption("Alerts are created by the background monitor (checks every 60 s while the app is running) "
-               "and stored in SQLite. 'Potential' = not confirmed yet; 'Confirmed' = closed candle beyond "
+    st.caption("Alerts are created by the separate background worker (checks every 60 s) and stored in the "
+               "shared database. 'Potential' = not confirmed yet; 'Confirmed' = closed candle beyond "
                "the level with volume confirmation. Only confirmed patterns, rapid moves and volume spikes "
                "are sent to Telegram.")
     f1, f2, f3 = st.columns(3)
-    asset = f1.selectbox("Asset", ["All"] + settings["watchlist"], key="alerts_asset")
+    asset = f1.selectbox("Asset", ["All"] + watched_symbols(settings), key="alerts_asset")
     atype = f2.selectbox("Type", ["All"] + ALERT_TYPES, key="alerts_type")
     limit = f3.selectbox("Show last", [50, 100, 200, 500], index=1, key="alerts_limit")
     df = get_alerts(limit=limit, asset=None if asset == "All" else asset,
@@ -2282,15 +2866,14 @@ def predictions_fragment():
     st.subheader("Prediction history")
     st.caption("This tab includes pending predictions as well as completed ones. Predictions are recorded "
                "from confirmed directional signals and evaluated after their saved time horizon.")
-    all_rows = get_predictions(limit=5000)
-    if all_rows.empty:
+    filter_options = get_prediction_filter_options()
+    assets = filter_options["asset"]
+    timeframes = [tf for tf in TIMEFRAMES if tf in set(filter_options["timeframe"])]
+    patterns = filter_options["pattern"]
+    if not assets:
         st.info("No predictions yet. Once the monitor detects a confirmed directional signal, it will appear here.")
         st.caption("Potential signals are not counted as predictions. Existing alert history is not deleted.")
         return
-
-    assets = sorted(all_rows["asset"].dropna().astype(str).unique().tolist())
-    timeframes = [tf for tf in TIMEFRAMES if tf in set(all_rows["timeframe"].dropna())]
-    patterns = sorted(all_rows["pattern"].dropna().astype(str).unique().tolist())
     filters = st.columns(5)
     asset = filters[0].selectbox("Asset", ["All"] + assets, key="pred_asset")
     timeframe = filters[1].selectbox("Timeframe", ["All"] + timeframes, key="pred_timeframe")
@@ -2351,26 +2934,37 @@ def predictions_fragment():
                "not actual account profit or a guarantee of future performance.")
 
 
+@st.cache_resource(show_spinner=False)
+def ensure_database_initialized():
+    init_db()
+    return True
+
+
 def main():
     st.set_page_config(page_title="Trading Intelligence Monitor", page_icon="📈", layout="wide")
     global RT
     RT = get_runtime()
-    init_db()
+    ensure_database_initialized()
 
     render_sidebar()
     st.title("📈 Trading Intelligence Monitor")
     st.caption("Tracks stocks and crypto, detects price moves and basic patterns, and alerts you. "
                "It does NOT trade or manage money. " + DISCLAIMER)
 
-    tab_dash, tab_chart, tab_alerts, tab_predictions = st.tabs(
-        ["📊 Dashboard", "📈 Chart Analysis", "🔔 Alerts & Patterns", "📜 Prediction History"])
-    with tab_dash:
+    page = st.radio(
+        "Section",
+        ["📊 Dashboard", "📈 Chart Analysis", "🔔 Alerts & Patterns", "📜 Prediction History"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="main_page",
+    )
+    if page == "📊 Dashboard":
         dashboard_fragment()
-    with tab_chart:
+    elif page == "📈 Chart Analysis":
         chart_analysis()
-    with tab_alerts:
+    elif page == "🔔 Alerts & Patterns":
         alerts_fragment()
-    with tab_predictions:
+    else:
         predictions_fragment()
 
 
