@@ -1,6 +1,7 @@
 """Trading Intelligence Monitor background worker.
 
 Run as a separate long-lived process: python worker.py
+For scheduled cloud jobs, pass --duration-seconds to exit cleanly after a bounded run.
 The Streamlit web process only reads/writes shared PostgreSQL data and never starts
 scanner or Telegram polling threads itself.
 """
@@ -18,6 +19,10 @@ def main() -> None:
     parser.add_argument(
         "--local-sqlite", action="store_true",
         help="allow local SQLite for development when web and worker share the same machine and project folder",
+    )
+    parser.add_argument(
+        "--duration-seconds", type=int, default=0,
+        help="stop after this many seconds (0 means run until the process is stopped)",
     )
     args = parser.parse_args()
 
@@ -58,11 +63,18 @@ def main() -> None:
     telegram_thread.start()
 
     app.log.info("TIM worker started. Data provider: Yahoo Finance via yfinance.")
+    stop_timer = None
     try:
+        if args.duration_seconds > 0:
+            stop_timer = threading.Timer(args.duration_seconds, stop_event.set)
+            stop_timer.daemon = True
+            stop_timer.start()
         app.monitor_loop(stop_event)
     finally:
         stop_event.set()
-        telegram_thread.join(timeout=5)
+        if stop_timer is not None:
+            stop_timer.cancel()
+        telegram_thread.join(timeout=35)
         app.RT.status["worker_state"] = "stopped"
         try:
             app.publish_monitor_status()
