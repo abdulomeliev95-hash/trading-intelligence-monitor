@@ -57,9 +57,7 @@ DEFAULT_SETTINGS = {
     "volume_mult": 2.0,      # volume spike = N x average of previous 20 candles
     "min_breakout_atr": 0.75, # minimum close distance beyond a broken level for Telegram
     "cooldown_minutes": 30,  # no repeated alert of the same kind within this time
-    # After a confirmed signal candle closes, evaluate the direction after this horizon.
-    "prediction_horizons_minutes": {"15m": 60, "1h": 240, "4h": 1440, "1d": 4320},
-    "prediction_neutral_pct": 0.25,  # smaller absolute moves are neutral, not wins/losses
+    "paper_starting_balance": 10000.0,
 }
 
 # interval/period are what Yahoo Finance understands; ttl = seconds we reuse cached data
@@ -73,6 +71,8 @@ TIMEFRAMES = {
 INTERVAL_MIN = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 INTRADAY = {"5m", "15m", "1h", "4h"}
 PATTERN_SCAN_TFS = ["15m", "1h", "4h", "1d"]  # strategy timeframes; 1m and 5m excluded
+PAPER_RISK_PCT = 2.0
+PAPER_REWARD_R = 3.0
 ALERT_TYPES = ["Double Top", "Double Bottom", "Head and Shoulders", "Inverse Head and Shoulders",
                "Change of Character", "Flip Zone Retest"]
 
@@ -207,12 +207,10 @@ def _merge_settings(saved: dict) -> dict:
     for key in DEFAULT_SETTINGS:
         if key in saved:
             settings[key] = saved[key]
-    horizons = dict(DEFAULT_SETTINGS["prediction_horizons_minutes"])
-    if isinstance(settings.get("prediction_horizons_minutes"), dict):
-        horizons.update(settings["prediction_horizons_minutes"])
-    settings["prediction_horizons_minutes"] = {
-        tf: horizons[tf] for tf in DEFAULT_SETTINGS["prediction_horizons_minutes"]
-    }
+    try:
+        settings["paper_starting_balance"] = max(1.0, float(settings.get("paper_starting_balance", 10000.0)))
+    except (TypeError, ValueError):
+        settings["paper_starting_balance"] = 10000.0
     raw_telegram_timeframes = settings.get("telegram_timeframes", [])
     if not isinstance(raw_telegram_timeframes, list):
         raw_telegram_timeframes = []
@@ -1399,7 +1397,30 @@ def init_db():
     db_execute(alerts_sql)
     db_execute("CREATE INDEX IF NOT EXISTS idx_alerts_lookup ON alerts (asset, alert_type, timeframe, status, created_at)")
     db_execute(predictions_sql)
-    db_execute("CREATE INDEX IF NOT EXISTS idx_predictions_due ON predictions (outcome, due_at)")
+    trade_columns = {
+        "stop_price": "DOUBLE PRECISION" if database_url() else "REAL",
+        "target_price": "DOUBLE PRECISION" if database_url() else "REAL",
+        "position_units": "DOUBLE PRECISION" if database_url() else "REAL",
+        "risk_amount": "DOUBLE PRECISION" if database_url() else "REAL",
+        "equity_at_entry": "DOUBLE PRECISION" if database_url() else "REAL",
+        "pnl_amount": "DOUBLE PRECISION" if database_url() else "REAL",
+        "pnl_equity_pct": "DOUBLE PRECISION" if database_url() else "REAL",
+        "pnl_r": "DOUBLE PRECISION" if database_url() else "REAL",
+        "mark_price": "DOUBLE PRECISION" if database_url() else "REAL",
+        "unrealized_pnl": "DOUBLE PRECISION" if database_url() else "REAL",
+        "unrealized_pnl_pct": "DOUBLE PRECISION" if database_url() else "REAL",
+        "mark_time": "TEXT",
+        "exit_reason": "TEXT",
+    }
+    if database_url():
+        for column, sql_type in trade_columns.items():
+            db_execute(f"ALTER TABLE predictions ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    else:
+        existing_columns = {row[1] for row in db_query("PRAGMA table_info(predictions)")}
+        for column, sql_type in trade_columns.items():
+            if column not in existing_columns:
+                db_execute(f"ALTER TABLE predictions ADD COLUMN {column} {sql_type}")
+    db_execute("CREATE INDEX IF NOT EXISTS idx_predictions_open ON predictions (outcome, signal_time)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_predictions_stats ON predictions (timeframe, pattern, outcome)")
     if database_url():
         db_execute("CREATE TABLE IF NOT EXISTS app_settings (id INTEGER PRIMARY KEY, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
@@ -1495,65 +1516,85 @@ def get_market_snapshots(symbols: list[str]) -> dict:
     return result
 
 
-def prediction_horizon(tf: str, settings: dict) -> int:
-    horizons = settings.get("prediction_horizons_minutes", DEFAULT_SETTINGS["prediction_horizons_minutes"])
-    return max(1, int(horizons.get(tf, INTERVAL_MIN[tf] * 4)))
-
-
 def is_prediction_event(ev: dict) -> bool:
-    """Only actionable confirmed directional events count as predictions."""
+    """Only confirmed directional signals create simulated positions."""
     return (ev.get("status") == "Confirmed"
             and ev.get("direction") in ("bull", "bear")
             and bool(ev.get("notify")))
 
 
-def record_prediction(alert_id: int, ev: dict, tf: str, settings: dict):
-    """Save one immutable prediction per stored alert. Entry is the signal candle close."""
+def _paper_trade_parameters(ev: dict, ind: pd.DataFrame, settings: dict) -> Optional[dict]:
+    """Build a stop-based paper position: 2% of equity at risk and a 3R target."""
+    event_time = pd.Timestamp(ev["event_time"])
+    if ind is None or event_time not in ind.index:
+        return None
+    row = ind.loc[event_time]
+    entry = float(ev["price"])
+    atr = float(row.get("ATR14", np.nan))
+    if entry <= 0 or not np.isfinite(entry) or not np.isfinite(atr) or atr <= 0:
+        return None
+    side = 1.0 if ev["direction"] == "bull" else -1.0
+    stop = (ev.get("plan") or {}).get("stop")
+    if stop is None:
+        level = ev.get("level")
+        stop = (float(level) - side * 0.25 * atr
+                if level is not None and np.isfinite(float(level))
+                else entry - side * atr)
+    stop = float(stop)
+    if (side > 0 and stop >= entry) or (side < 0 and stop <= entry):
+        stop = entry - side * atr
+    risk_per_unit = abs(entry - stop)
+    if not np.isfinite(risk_per_unit) or risk_per_unit <= 0:
+        return None
+    target = entry + side * PAPER_REWARD_R * risk_per_unit
+    starting_balance = float(settings.get("paper_starting_balance", 10000.0))
+    realized = db_query("SELECT COALESCE(SUM(pnl_amount), 0) FROM predictions WHERE outcome IS NOT NULL")[0][0]
+    equity = max(0.01, starting_balance + float(realized or 0.0))
+    risk_amount = equity * PAPER_RISK_PCT / 100.0
+    units = risk_amount / risk_per_unit
+    signal_time = event_time + pd.Timedelta(minutes=INTERVAL_MIN[ev["timeframe"]])
+    return {"entry": entry, "stop": stop, "target": target, "equity": equity,
+            "risk_amount": risk_amount, "units": units, "signal_time": signal_time}
+
+
+def record_prediction(alert_id: int, ev: dict, tf: str, settings: dict, ind=None):
+    """Record a paper trade for a confirmed signal; no time-based close is used."""
     if not is_prediction_event(ev):
         return None
-    horizon = prediction_horizon(tf, settings)
-    signal_time = pd.Timestamp(ev["event_time"]) + pd.Timedelta(minutes=INTERVAL_MIN[tf])
-    due_at = signal_time + pd.Timedelta(minutes=horizon)
-    ev["prediction_horizon_minutes"] = horizon
     existing = db_query("SELECT id FROM predictions WHERE alert_id=?", (alert_id,))
     if existing:
         return int(existing[0][0])
+    plan = _paper_trade_parameters(ev, ind, settings)
+    if plan is None:
+        log.info("Paper trade skipped for %s %s: no valid ATR stop.", ev["asset"], tf)
+        return None
+    ev["paper_trade"] = plan
+    signal_time_text = plan["signal_time"].strftime("%Y-%m-%d %H:%M:%S")
     return db_execute(
         "INSERT INTO predictions (alert_id, asset, timeframe, pattern, direction, entry_price, signal_time, "
-        "horizon_minutes, neutral_pct, due_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "horizon_minutes, neutral_pct, due_at, stop_price, target_price, position_units, risk_amount, "
+        "equity_at_entry, mark_price, unrealized_pnl, unrealized_pnl_pct, mark_time) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (alert_id, ev["asset"], tf, ev["alert_type"], ev["direction"], float(ev["price"]),
-         signal_time.strftime("%Y-%m-%d %H:%M:%S"), horizon,
-         float(settings.get("prediction_neutral_pct", 0.25)), due_at.strftime("%Y-%m-%d %H:%M:%S")))
+         signal_time_text, 0, 0.0, signal_time_text, plan["stop"], plan["target"], plan["units"],
+         plan["risk_amount"], plan["equity"], plan["entry"], 0.0, 0.0, signal_time_text))
 
 
 def mark_prediction_telegram_sent(prediction_id: int):
     db_execute("UPDATE predictions SET telegram_sent=1 WHERE id=?", (prediction_id,))
 
 
-def _prediction_outcome(direction: str, return_pct: float, neutral_pct: float) -> str:
-    if direction == "bull":
-        if return_pct >= neutral_pct:
-            return "SUCCESS"
-        if return_pct <= -neutral_pct:
-            return "FAILED"
-    else:
-        if return_pct <= -neutral_pct:
-            return "SUCCESS"
-        if return_pct >= neutral_pct:
-            return "FAILED"
-    return "NEUTRAL"
-
-
 def evaluate_due_predictions(settings=None) -> int:
-    """Evaluate due predictions at the first completed candle closing at/after their horizon."""
+    """Mark open paper trades and close only when stop or target is reached."""
     settings = settings or load_settings()
     now_text = now_naive_utc().strftime("%Y-%m-%d %H:%M:%S")
     due = db_query(
-        "SELECT id, asset, timeframe, direction, entry_price, due_at, neutral_pct, telegram_sent "
-        "FROM predictions WHERE outcome IS NULL AND due_at<=? ORDER BY due_at LIMIT 100",
-        (now_text,))
+        "SELECT id, asset, timeframe, direction, entry_price, stop_price, target_price, signal_time, "
+        "exit_candle_time, risk_amount, position_units, equity_at_entry FROM predictions "
+        "WHERE outcome IS NULL ORDER BY signal_time LIMIT 500")
     evaluated = 0
-    for pred_id, asset, tf, direction, entry, due_at, neutral_pct, telegram_sent in due:
+    for (pred_id, asset, tf, direction, entry, stop, target, signal_time, last_checked,
+         risk_amount, units, equity_at_entry) in due:
         try:
             res = fetch_candles(asset, tf)
             if res.df is None or res.df.empty:
@@ -1561,42 +1602,74 @@ def evaluate_due_predictions(settings=None) -> int:
             closed = closed_candles(res.df, tf)
             if closed.empty:
                 continue
-            due_ts = pd.Timestamp(due_at)
             candle_closes = closed.index + pd.Timedelta(minutes=INTERVAL_MIN[tf])
-            eligible = np.flatnonzero(candle_closes >= due_ts)
+            start_after = pd.Timestamp(last_checked or signal_time)
+            eligible = np.flatnonzero(candle_closes > start_after)
             if len(eligible) == 0:
-                continue  # the target candle has not closed yet
-            pos = int(eligible[0])
-            exit_price = float(closed["Close"].iloc[pos])
-            if entry <= 0 or not np.isfinite(exit_price):
                 continue
-            return_pct = (exit_price / float(entry) - 1.0) * 100.0
-            outcome = _prediction_outcome(direction, return_pct, float(neutral_pct))
-            exit_time = pd.Timestamp(candle_closes[pos]).strftime("%Y-%m-%d %H:%M:%S")
-            evaluated_at = now_text
-            db_execute(
-                "UPDATE predictions SET evaluated_at=?, exit_candle_time=?, exit_price=?, return_pct=?, outcome=? "
-                "WHERE id=? AND outcome IS NULL",
-                (evaluated_at, exit_time, exit_price, return_pct, outcome, pred_id))
-            evaluated += 1
-        except Exception as exc:
-            log.warning("Prediction evaluation failed for %s %s: %s", asset, tf, redact(exc))
+            side = 1.0 if direction == "bull" else -1.0
+            closed_trade = None
+            for pos in eligible:
+                bar = closed.iloc[int(pos)]
+                open_price = float(bar["Open"])
+                hit_stop = float(bar["Low"]) <= float(stop) if side > 0 else float(bar["High"]) >= float(stop)
+                hit_target = float(bar["High"]) >= float(target) if side > 0 else float(bar["Low"]) <= float(target)
+                if hit_stop:
+                    # A gap through the stop gets the worse candle-open fill.
+                    exit_price = min(float(stop), open_price) if side > 0 else max(float(stop), open_price)
+                    outcome, reason = "FAILED", "STOP"
+                elif hit_target:
+                    exit_price, outcome, reason = float(target), "SUCCESS", "TARGET"
+                else:
+                    continue
+                exit_time = pd.Timestamp(candle_closes[int(pos)]).strftime("%Y-%m-%d %H:%M:%S")
+                directional_return = side * (exit_price / float(entry) - 1.0) * 100.0
+                pnl_amount = side * (exit_price - float(entry)) * float(units)
+                pnl_equity_pct = pnl_amount / float(equity_at_entry) * 100.0
+                pnl_r = pnl_amount / float(risk_amount)
+                closed_trade = (exit_price, outcome, reason, exit_time, directional_return,
+                                pnl_amount, pnl_equity_pct, pnl_r)
+                break
 
-    # Deliver results only for original signals that were actually sent to this Telegram chat.
+            if closed_trade:
+                (exit_price, outcome, reason, exit_time, directional_return, pnl_amount,
+                 pnl_equity_pct, pnl_r) = closed_trade
+                db_execute(
+                    "UPDATE predictions SET evaluated_at=?, exit_candle_time=?, exit_price=?, return_pct=?, "
+                    "outcome=?, exit_reason=?, pnl_amount=?, pnl_equity_pct=?, pnl_r=?, mark_price=?, "
+                    "unrealized_pnl=0, unrealized_pnl_pct=0 WHERE id=? AND outcome IS NULL",
+                    (now_text, exit_time, exit_price, directional_return, outcome, reason, pnl_amount,
+                     pnl_equity_pct, pnl_r, exit_price, pred_id))
+                evaluated += 1
+            else:
+                latest = int(eligible[-1])
+                mark_price = float(closed["Close"].iloc[latest])
+                mark_time = pd.Timestamp(candle_closes[latest]).strftime("%Y-%m-%d %H:%M:%S")
+                unrealized = side * (mark_price - float(entry)) * float(units)
+                unrealized_pct = unrealized / float(equity_at_entry) * 100.0
+                db_execute(
+                    "UPDATE predictions SET exit_candle_time=?, mark_price=?, unrealized_pnl=?, "
+                    "unrealized_pnl_pct=?, mark_time=? WHERE id=? AND outcome IS NULL",
+                    (mark_time, mark_price, unrealized, unrealized_pct, mark_time, pred_id))
+        except Exception as exc:
+            log.warning("Paper trade evaluation failed for %s %s: %s", asset, tf, redact(exc))
+
+    # Report closure P&L only for signals that were sent to Telegram.
     if telegram_configured():
         unsent = db_query(
-            "SELECT id, asset, timeframe, pattern, direction, entry_price, exit_price, return_pct, outcome, "
-            "horizon_minutes, exit_candle_time FROM predictions "
+            "SELECT id, asset, timeframe, pattern, direction, entry_price, stop_price, target_price, "
+            "exit_price, pnl_amount, pnl_equity_pct, pnl_r, outcome, exit_reason, exit_candle_time "
+            "FROM predictions "
             "WHERE outcome IS NOT NULL AND telegram_sent=1 AND result_notified=0 ORDER BY evaluated_at LIMIT 50")
         for row in unsent:
-            (pred_id, asset, tf, pattern, direction, entry, exit_price, change, outcome,
-             horizon, exit_time) = row
+            (pred_id, asset, tf, pattern, direction, entry, stop, target, exit_price,
+             pnl_amount, pnl_pct, pnl_r, outcome, reason, exit_time) = row
             side = "LONG" if direction == "bull" else "SHORT"
-            icon = {"SUCCESS": "✅", "FAILED": "❌", "NEUTRAL": "➖"}[outcome]
-            message = (f"{icon} Prediction result: {outcome}\n{asset} | {side} | {pattern} | {tf}\n"
-                       f"Entry: {fmt_price(entry)}\nCheck price: {fmt_price(exit_price)}\n"
-                       f"Price change: {fmt_pct(change)}\nPlanned horizon: {horizon} min\n"
-                       f"Evaluation candle close: {exit_time} UTC")
+            icon = "✅" if outcome == "SUCCESS" else "❌"
+            message = (f"{icon} Paper trade closed: {reason}\n{asset} | {side} | {pattern} | {tf}\n"
+                       f"Entry: {fmt_price(entry)} | Stop: {fmt_price(stop)} | Target: {fmt_price(target)}\n"
+                       f"Exit: {fmt_price(exit_price)}\nP&L: {pnl_amount:+.2f} "
+                       f"({pnl_pct:+.2f}% equity, {pnl_r:+.2f}R)\nClosed candle: {exit_time} UTC")
             ok, _ = tg_send_message(message)
             if ok:
                 db_execute("UPDATE predictions SET result_notified=1 WHERE id=?", (pred_id,))
@@ -1618,28 +1691,29 @@ def cmd_stats(mode="summary", timeframe=None, pattern=None) -> str:
     where, params = _prediction_filters(timeframe, pattern)
     totals = db_query(
         f"SELECT COUNT(*), SUM(CASE WHEN outcome='SUCCESS' THEN 1 ELSE 0 END), "
-        f"SUM(CASE WHEN outcome='FAILED' THEN 1 ELSE 0 END), "
-        f"SUM(CASE WHEN outcome='NEUTRAL' THEN 1 ELSE 0 END) FROM predictions WHERE {where}", tuple(params))[0]
-    total, wins, losses, neutral = (int(v or 0) for v in totals)
+        f"SUM(CASE WHEN outcome='FAILED' THEN 1 ELSE 0 END) FROM predictions WHERE {where}", tuple(params))[0]
+    total, wins, losses = (int(v or 0) for v in totals)
     decided = wins + losses
     win_rate = wins / decided * 100 if decided else 0.0
-    title = "📊 Prediction statistics"
+    pnl_total = db_query(f"SELECT COALESCE(SUM(pnl_amount), 0) FROM predictions WHERE {where}", tuple(params))[0][0]
+    total_r = db_query(f"SELECT COALESCE(SUM(pnl_r), 0) FROM predictions WHERE {where}", tuple(params))[0][0]
+    title = "📊 Paper trading statistics"
     if timeframe:
         title += f" — {timeframe}"
     if pattern:
         title += f" — {pattern}"
-    lines = [title, f"Completed: {total} | ✅ {wins} | ❌ {losses} | ➖ {neutral}",
-             f"Win rate (excluding neutral): {win_rate:.1f}% ({wins}/{decided})"]
+    lines = [title, f"Closed trades: {total} | ✅ {wins} | ❌ {losses}",
+             f"Win rate: {win_rate:.1f}% ({wins}/{decided})",
+             f"Realized P&L: {float(pnl_total or 0):+.2f} ({float(total_r or 0):+.2f}R), before costs"]
     if total == 0:
-        lines.append("No evaluated predictions yet. Pending predictions are not included.")
+        lines.append("No paper trades have reached a stop or target yet.")
         return "\n".join(lines)
     if mode in ("patterns", "timeframes", "detailed"):
         group_cols = {"patterns": "pattern", "timeframes": "timeframe",
                       "detailed": "timeframe, pattern"}[mode]
         rows = db_query(
             f"SELECT {group_cols}, COUNT(*), SUM(CASE WHEN outcome='SUCCESS' THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN outcome='FAILED' THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN outcome='NEUTRAL' THEN 1 ELSE 0 END) "
+            f"SUM(CASE WHEN outcome='FAILED' THEN 1 ELSE 0 END) "
             f"FROM predictions WHERE {where} GROUP BY {group_cols} ORDER BY COUNT(*) DESC LIMIT 25",
             tuple(params))
         lines.extend(["", f"By {mode}:"])
@@ -1648,30 +1722,30 @@ def cmd_stats(mode="summary", timeframe=None, pattern=None) -> str:
                 label = f"{row[0]} / {row[1]}"
             else:
                 label = str(row[0])
-            count, w, l, n = (int(v or 0) for v in row[-4:])
+            count, w, l = (int(v or 0) for v in row[-3:])
             rate = w / (w + l) * 100 if w + l else 0.0
-            lines.append(f"• {label}: {rate:.1f}% | {count} total (✅{w} ❌{l} ➖{n})")
+            lines.append(f"• {label}: {rate:.1f}% | {count} closed (✅{w} ❌{l})")
     return "\n".join(lines)
 
 
 def cmd_prediction_history(limit=8) -> str:
-    """Compact Telegram view of the latest evaluated and still-pending predictions."""
+    """Compact Telegram view of latest open and closed paper trades."""
     df = get_predictions(limit=limit)
     if df.empty:
-        return "📜 Prediction history\nNo predictions stored yet. Only confirmed directional signals are tracked."
-    lines = ["📜 Recent prediction history", "P/L is directional and before fees/slippage."]
+        return "📜 Paper trade history\nNo paper trades stored yet. Only confirmed directional signals are tracked."
+    lines = ["📜 Recent paper trades", "Gross P&L before fees, spread and slippage."]
     for row in df.itertuples(index=False):
         side = "LONG" if row.direction == "bull" else "SHORT"
         if row.outcome is None or pd.isna(row.outcome):
-            result = "⏳ PENDING"
-            pnl_text = "not evaluated yet"
+            result = "⏳ OPEN"
+            pnl_text = f"unrealized {float(row.unrealized_pnl or 0):+.2f} ({float(row.unrealized_pnl_pct or 0):+.2f}% equity)"
         else:
-            icon = {"SUCCESS": "✅", "FAILED": "❌", "NEUTRAL": "➖"}.get(row.outcome, "•")
-            result = f"{icon} {row.outcome}"
-            pnl_text = fmt_pct(prediction_pnl_pct(row.direction, row.return_pct))
+            icon = {"SUCCESS": "✅", "FAILED": "❌"}.get(row.outcome, "•")
+            result = f"{icon} {row.exit_reason or row.outcome}"
+            pnl_text = f"{float(row.pnl_amount or 0):+.2f} ({float(row.pnl_equity_pct or 0):+.2f}% equity, {float(row.pnl_r or 0):+.2f}R)"
         lines.append(f"\n{row.asset} | {side} | {row.timeframe}")
-        lines.append(f"{row.pattern} — {result} | directional P/L {pnl_text}")
-        lines.append(f"Entry {fmt_price(row.entry_price)} | horizon {row.horizon_minutes} min")
+        lines.append(f"{row.pattern} — {result} | P&L {pnl_text}")
+        lines.append(f"Entry {fmt_price(row.entry_price)} | Stop {fmt_price(row.stop_price)} | Target {fmt_price(row.target_price)}")
     return "\n".join(lines)[:3900]
 
 
@@ -1729,18 +1803,12 @@ def get_alerts(limit=200, asset=None, alert_type=None, since_minutes=None) -> pd
 
 PREDICTION_COLUMNS = [
     "id", "alert_id", "asset", "timeframe", "pattern", "direction", "entry_price",
-    "signal_time", "horizon_minutes", "neutral_pct", "due_at", "telegram_sent",
+    "signal_time", "telegram_sent",
     "evaluated_at", "exit_candle_time", "exit_price", "return_pct", "outcome",
-    "result_notified", "description",
+    "result_notified", "description", "stop_price", "target_price", "position_units",
+    "risk_amount", "equity_at_entry", "pnl_amount", "pnl_equity_pct", "pnl_r",
+    "mark_price", "unrealized_pnl", "unrealized_pnl_pct", "mark_time", "exit_reason",
 ]
-
-
-def prediction_pnl_pct(direction, return_pct):
-    """Directional, unleveraged gross return: LONG benefits from a rise; SHORT from a fall."""
-    if return_pct is None or pd.isna(return_pct):
-        return None
-    value = float(return_pct)
-    return -value if str(direction).lower() == "bear" else value
 
 
 def get_prediction_filter_options() -> dict:
@@ -1781,16 +1849,16 @@ def get_predictions(limit=500, asset=None, timeframe=None, pattern=None, outcome
         "oldest": "p.signal_time ASC, p.id ASC",
         "asset": "p.asset ASC, p.signal_time DESC",
         "pattern": "p.pattern ASC, p.signal_time DESC",
-        "best": "CASE WHEN p.return_pct IS NULL THEN 1 ELSE 0 END ASC, "
-                "(CASE WHEN p.direction='bear' THEN -p.return_pct ELSE p.return_pct END) DESC",
-        "worst": "CASE WHEN p.return_pct IS NULL THEN 1 ELSE 0 END ASC, "
-                 "(CASE WHEN p.direction='bear' THEN -p.return_pct ELSE p.return_pct END) ASC",
+        "best": "CASE WHEN p.outcome IS NULL THEN p.unrealized_pnl ELSE p.pnl_amount END DESC",
+        "worst": "CASE WHEN p.outcome IS NULL THEN p.unrealized_pnl ELSE p.pnl_amount END ASC",
     }.get(sort_by, "p.signal_time DESC, p.id DESC")
     sql = (
         "SELECT p.id, p.alert_id, p.asset, p.timeframe, p.pattern, p.direction, p.entry_price, "
-        "p.signal_time, p.horizon_minutes, p.neutral_pct, p.due_at, p.telegram_sent, "
-        "p.evaluated_at, p.exit_candle_time, p.exit_price, p.return_pct, p.outcome, "
-        "p.result_notified, COALESCE(a.description, '') "
+        "p.signal_time, p.telegram_sent, p.evaluated_at, p.exit_candle_time, p.exit_price, "
+        "p.return_pct, p.outcome, "
+        "p.result_notified, COALESCE(a.description, ''), p.stop_price, p.target_price, p.position_units, "
+        "p.risk_amount, p.equity_at_entry, p.pnl_amount, p.pnl_equity_pct, p.pnl_r, p.mark_price, "
+        "p.unrealized_pnl, p.unrealized_pnl_pct, p.mark_time, p.exit_reason "
         "FROM predictions p LEFT JOIN alerts a ON a.id=p.alert_id"
     )
     if where:
@@ -2006,15 +2074,21 @@ def build_message(ev: dict) -> str:
     title = ev["alert_type"] if ev["status"] in ("Info", "Test") else f"{ev['alert_type']} ({ev['status']})"
     if ev["status"] == "Test":
         title = "🧪 " + title
+    paper = ev.get("paper_trade")
+    paper_lines = []
+    if paper:
+        paper_lines = [
+            f"Paper trade only: risk {PAPER_RISK_PCT:g}% ({chr(36)}{paper['risk_amount']:.2f}) | target {PAPER_REWARD_R:g}R",
+            f"Entry {fmt_price(paper['entry'])} | Stop {fmt_price(paper['stop'])} | Target {fmt_price(paper['target'])}",
+            f"Position size: {paper['units']:.6f} units | account equity: {chr(36)}{paper['equity']:.2f}",
+        ]
     head = "\n".join([
         f"{icon} {title}",
         f"Asset: {asset_label(ev['asset'])}",
         f"Price: {fmt_price(ev['price'])}",
         f"Change: {fmt_pct(ev['change_pct'])} ({ev['change_label']})",
         f"Timeframe: {ev['timeframe']}",
-        *([f"Prediction: {'LONG' if ev['direction'] == 'bull' else 'SHORT'}",
-           f"Result check after: {ev['prediction_horizon_minutes']} min"]
-          if ev.get("prediction_horizon_minutes") else []),
+        *paper_lines,
         f"Indicators: {ev['indicators'] or 'n/a'}"])
     tail = f"Candle time: {fmt_ts(ev['event_time'])} UTC\n{DISCLAIMER}"
     room = 1024 - len(head) - len(tail) - len("Why: ") - 2       # 2 line breaks
@@ -2111,13 +2185,10 @@ def cmd_status() -> str:
         f"Market data requests: {market_requests} | avg latency: {market_avg:.0f} ms | cache hit: {cache_hit_pct:.1f}%",
         f"Database queries: {db_queries} | avg latency: {db_avg:.1f} ms",
         f"Assets watched: {len(watched_symbols(cfg))}",
-        f"Crypto threshold: {cfg['crypto_pct']:g}% / {cfg['crypto_minutes']} min",
-        f"Stock threshold: {cfg['stock_pct']:g}% / {cfg['stock_minutes']} min",
-        f"Volume spike: {cfg['volume_mult']:g}x | cooldown: {cfg['cooldown_minutes']} min",
+        f"Cooldown between repeated alerts: {cfg['cooldown_minutes']} min",
         f"Minimum structural break for Telegram: {cfg.get('min_breakout_atr', DEFAULT_SETTINGS['min_breakout_atr']):g} ATR",
         f"Sent to Telegram: {', '.join(cfg['telegram_timeframes']) or 'nothing'} (other timeframes: history only)",
-        f"Prediction horizons (min): {cfg.get('prediction_horizons_minutes', DEFAULT_SETTINGS['prediction_horizons_minutes'])}",
-        f"Neutral threshold: {cfg.get('prediction_neutral_pct', 0.25):g}%",
+        f"Paper trading: {PAPER_RISK_PCT:g}% risk / {PAPER_REWARD_R:g}R target | starting balance: ${cfg.get('paper_starting_balance', 10000.0):,.2f}",
         f"Database: {'PostgreSQL' if database_url() else 'local SQLite (not durable on ephemeral hosting)'}",
         f"Last monitor error: {s.get('last_error') or 'none'}",
         "Data: Yahoo Finance for configured assets; Polymarket Perps API for -PERP instruments."])
@@ -2125,8 +2196,8 @@ def cmd_status() -> str:
 def telegram_main_keyboard():
     """Small phone-friendly home menu; no command typing is required for common tasks."""
     return {"inline_keyboard": [
-        [{"text": "📊 Statistics", "callback_data": "ui:stats"},
-         {"text": "📜 Prediction history", "callback_data": "ui:history"}],
+        [{"text": "📊 Paper P&L", "callback_data": "ui:stats"},
+         {"text": "📜 Paper trades", "callback_data": "ui:history"}],
         [{"text": "📋 Watchlist", "callback_data": "ui:watchlist"},
          {"text": "🔔 Latest alerts", "callback_data": "ui:alerts"}],
         [{"text": "⚙️ Monitor status", "callback_data": "ui:status"},
@@ -2400,7 +2471,7 @@ def process_event(ev: dict, ind: pd.DataFrame, tf: str, settings: dict):
     quality_ok = passes_notification_quality(ev, settings)
     prediction_id = None
     if is_prediction_event(ev) and quality_ok and tf in PATTERN_SCAN_TFS:
-        prediction_id = record_prediction(alert_id, ev, tf, settings)
+        prediction_id = record_prediction(alert_id, ev, tf, settings, ind)
     if ev["notify"] and quality_ok and routed and telegram_configured():
         ok, info = send_alert_notification(ev, ind, tf)
         if ok and prediction_id is not None:
@@ -2621,25 +2692,16 @@ def render_sidebar():
             save_settings(settings)
             st.success("Saved. The background monitor uses the new values on its next cycle.")
 
-    sb.subheader("Prediction tracking")
-    with sb.form("prediction_tracking"):
-        horizons_now = settings.get("prediction_horizons_minutes", DEFAULT_SETTINGS["prediction_horizons_minutes"])
-        h15 = st.number_input("15m signal: check after (minutes)", 15, 1440,
-                              int(horizons_now.get("15m", 60)), 15)
-        h1 = st.number_input("1h signal: check after (minutes)", 60, 2880,
-                             int(horizons_now.get("1h", 240)), 60)
-        h4 = st.number_input("4h signal: check after (minutes)", 240, 10080,
-                             int(horizons_now.get("4h", 1440)), 240)
-        h1d = st.number_input("1d signal: check after (minutes)", 1440, 20160,
-                              int(horizons_now.get("1d", 4320)), 1440)
-        neutral_pct = st.number_input("Neutral movement threshold (%)", 0.05, 5.0,
-                                      float(settings.get("prediction_neutral_pct", 0.25)), 0.05)
-        if st.form_submit_button("💾 Save prediction settings"):
-            settings["prediction_horizons_minutes"] = {"15m": int(h15), "1h": int(h1),
-                                                        "4h": int(h4), "1d": int(h1d)}
-            settings["prediction_neutral_pct"] = float(neutral_pct)
+    sb.subheader("Paper trading")
+    with sb.form("paper_trade_settings"):
+        paper_balance = st.number_input(
+            "Starting virtual account balance ($)", min_value=100.0, max_value=10000000.0,
+            value=float(settings.get("paper_starting_balance", 10000.0)), step=100.0)
+        st.caption("Fixed rules: 2% account risk per signal, 3R target. A paper position stays open until its stop or target is reached; no time-based exit and no real orders.")
+        if st.form_submit_button("💾 Save paper trading settings"):
+            settings["paper_starting_balance"] = float(paper_balance)
             save_settings(settings)
-            st.success("Prediction settings saved. They apply to new signals; existing predictions keep their original horizon.")
+            st.success("Paper account balance saved. It applies to new signals.")
 
     with sb.expander("📨 Telegram notifications"):
         if telegram_configured():
@@ -2863,29 +2925,28 @@ def alerts_fragment():
 @st.fragment(run_every=REFRESH_SECONDS)
 def predictions_fragment():
     """Dedicated, filterable and sortable history of every confirmed directional prediction."""
-    st.subheader("Prediction history")
-    st.caption("This tab includes pending predictions as well as completed ones. Predictions are recorded "
-               "from confirmed directional signals and evaluated after their saved time horizon.")
+    st.subheader("Paper trade ledger")
+    st.caption("Confirmed directional signals open simulated positions with 2% account risk and a 3R target. "
+               "Positions close only when stop or target is touched; P&L is updated from closed candles, with no time exit.")
     filter_options = get_prediction_filter_options()
     assets = filter_options["asset"]
     timeframes = [tf for tf in TIMEFRAMES if tf in set(filter_options["timeframe"])]
     patterns = filter_options["pattern"]
     if not assets:
-        st.info("No predictions yet. Once the monitor detects a confirmed directional signal, it will appear here.")
+        st.info("No paper trades yet. A confirmed directional signal will appear here once detected.")
         st.caption("Potential signals are not counted as predictions. Existing alert history is not deleted.")
         return
     filters = st.columns(5)
     asset = filters[0].selectbox("Asset", ["All"] + assets, key="pred_asset")
     timeframe = filters[1].selectbox("Timeframe", ["All"] + timeframes, key="pred_timeframe")
     pattern = filters[2].selectbox("Pattern", ["All"] + patterns, key="pred_pattern")
-    result_label = filters[3].selectbox("Result", ["All", "Pending", "Success", "Failed", "Neutral"],
+    result_label = filters[3].selectbox("Status", ["All", "Open", "Target hit", "Stop hit"],
                                         key="pred_result")
     sort_label = filters[4].selectbox(
         "Sort by", ["Newest first", "Oldest first", "Highest P/L", "Lowest P/L", "Asset A–Z", "Pattern A–Z"],
         key="pred_sort")
     limit = st.selectbox("Rows", [50, 100, 200, 500, 1000, 5000], index=2, key="pred_limit")
-    result_value = {"Pending": "PENDING", "Success": "SUCCESS", "Failed": "FAILED", "Neutral": "NEUTRAL"}.get(
-        result_label)
+    result_value = {"Open": "PENDING", "Target hit": "SUCCESS", "Stop hit": "FAILED"}.get(result_label)
     sort_value = {"Newest first": "newest", "Oldest first": "oldest", "Highest P/L": "best",
                   "Lowest P/L": "worst", "Asset A–Z": "asset", "Pattern A–Z": "pattern"}[sort_label]
     df = get_predictions(limit=limit, asset=None if asset == "All" else asset,
@@ -2899,15 +2960,16 @@ def predictions_fragment():
     completed = df[df["outcome"].notna()]
     wins = int((completed["outcome"] == "SUCCESS").sum())
     losses = int((completed["outcome"] == "FAILED").sum())
-    neutral = int((completed["outcome"] == "NEUTRAL").sum())
     decided = wins + losses
     win_rate = wins / decided * 100 if decided else 0.0
+    realized = float(completed["pnl_amount"].fillna(0).sum())
+    open_pnl = float(df.loc[df["outcome"].isna(), "unrealized_pnl"].fillna(0).sum())
     metrics = st.columns(5)
-    metrics[0].metric("Predictions", len(df))
-    metrics[1].metric("Pending", int(df["outcome"].isna().sum()))
-    metrics[2].metric("Successful", wins)
-    metrics[3].metric("Failed", losses)
-    metrics[4].metric("Win rate", f"{win_rate:.1f}%" if decided else "n/a")
+    metrics[0].metric("Trades", len(df))
+    metrics[1].metric("Open", int(df["outcome"].isna().sum()), f"unrealized ${open_pnl:+.2f}")
+    metrics[2].metric("Realized P&L", f"${realized:+.2f}")
+    metrics[3].metric("Win rate", f"{win_rate:.1f}%" if decided else "n/a")
+    metrics[4].metric("Closed", len(completed), f"{wins} targets / {losses} stops")
 
     table = pd.DataFrame({
         "Signal time (UTC)": df["signal_time"],
@@ -2916,22 +2978,29 @@ def predictions_fragment():
         "Timeframe": df["timeframe"],
         "Direction": df["direction"].map({"bull": "LONG", "bear": "SHORT"}),
         "Entry price": df["entry_price"],
+        "Stop": df["stop_price"],
+        "Target": df["target_price"],
+        "Position units": df["position_units"],
+        "Risk $": df["risk_amount"],
         "Exit price": df["exit_price"],
-        "Underlying move %": df["return_pct"],
-        "Directional P/L %": [prediction_pnl_pct(d, r) for d, r in zip(df["direction"], df["return_pct"])],
-        "Outcome": df["outcome"].fillna("PENDING"),
-        "Horizon (min)": df["horizon_minutes"],
-        "Evaluation candle (UTC)": df["exit_candle_time"],
+        "Mark price": df["mark_price"],
+        "Realized P&L $": df["pnl_amount"],
+        "Open P&L $": df["unrealized_pnl"],
+        "P&L % equity": df.apply(lambda row: row["pnl_equity_pct"] if pd.notna(row["outcome"]) else row["unrealized_pnl_pct"], axis=1),
+        "P&L R": df.apply(lambda row: row["pnl_r"] if pd.notna(row["outcome"]) else row["unrealized_pnl"] / row["risk_amount"] if row["risk_amount"] else None, axis=1),
+        "Status": df.apply(lambda row: row["exit_reason"] or row["outcome"] if pd.notna(row["outcome"]) else "OPEN", axis=1),
+        "Last checked candle (UTC)": df["mark_time"],
         "Signal explanation": df["description"],
     })
-    styled = table.style.map(_color_pct, subset=["Underlying move %", "Directional P/L %"]).format(
-        {"Entry price": fmt_price, "Exit price": fmt_price,
-         "Underlying move %": fmt_pct, "Directional P/L %": fmt_pct})
+    styled = table.style.map(_color_pct, subset=["P&L % equity", "P&L R"]).format(
+        {"Entry price": fmt_price, "Stop": fmt_price, "Target": fmt_price,
+         "Exit price": fmt_price, "Mark price": fmt_price,
+         "Risk $": "${:,.2f}", "Realized P&L $": "${:+,.2f}", "Open P&L $": "${:+,.2f}",
+         "P&L % equity": "{:+.2f}%", "P&L R": "{:+.2f}R", "Position units": "{:.6f}"})
     st.dataframe(styled, hide_index=True, use_container_width=True)
-    st.caption("Directional P/L is the unleveraged theoretical result from entry to the evaluation candle close: "
-               "LONG = price change; SHORT = the inverse of price change. It excludes commissions, spread, "
-               "slippage, borrow costs and execution constraints. This is a historical signal evaluation, "
-               "not actual account profit or a guarantee of future performance.")
+    st.caption("P&L is simulated and gross before fees, funding, spread, slippage and execution constraints. "
+               "Each trade risks 2% of equity at entry; the target is 3 times the entry-to-stop distance. "
+               "This ledger does not place real orders.")
 
 
 @st.cache_resource(show_spinner=False)
@@ -2948,12 +3017,12 @@ def main():
 
     render_sidebar()
     st.title("📈 Trading Intelligence Monitor")
-    st.caption("Tracks stocks and crypto, detects price moves and basic patterns, and alerts you. "
-               "It does NOT trade or manage money. " + DISCLAIMER)
+    st.caption("Tracks stocks and crypto, detects patterns, and records simulated paper trades. "
+               "It does not send real orders or manage money. " + DISCLAIMER)
 
     page = st.radio(
         "Section",
-        ["📊 Dashboard", "📈 Chart Analysis", "🔔 Alerts & Patterns", "📜 Prediction History"],
+        ["📊 Dashboard", "📈 Chart Analysis", "🔔 Alerts & Patterns", "📜 Paper trade ledger"],
         horizontal=True,
         label_visibility="collapsed",
         key="main_page",
