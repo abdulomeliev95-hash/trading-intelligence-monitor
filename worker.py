@@ -50,6 +50,15 @@ def main() -> None:
     if not app.acquire_worker_lock():
         raise SystemExit("Another TIM background worker already holds the database lock.")
 
+    if app.tg_token():
+        ok, result = app.tg_request("getMe", http="get")
+        if ok:
+            app.log.info("Telegram token accepted for @%s.", result.get("username", "unknown bot"))
+        else:
+            app.log.warning("Telegram token check failed: %s", result)
+    else:
+        app.log.warning("Telegram token is not configured; outgoing notifications are disabled.")
+
     app.RT.status["started_at"] = app.utc_now()
     app.RT.status["worker_state"] = "starting"
     app.publish_monitor_status()

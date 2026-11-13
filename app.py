@@ -113,6 +113,12 @@ WORKER_ADVISORY_LOCK_KEY = 7312042601
 STALE_MIN = {"crypto": 30, "stock": 45}  # data older than this is flagged as stale
 POLYMARKET_PERPS_API = "https://api.perpetuals.polymarket.com"
 POLYMARKET_PERPS_REFRESH_SEC = 3600
+YAHOO_TICKER_ALIASES = {
+    "SKHYNIX": "SKHY",  # Yahoo's USD Nasdaq listing for SK hynix
+    "SAMSUNG": "SMSN.IL",  # Yahoo's USD London listing for Samsung Electronics
+}
+_YAHOO_INIT_LOCK = threading.Lock()
+_YAHOO_CACHE_PRIMED = False
 
 UP, DOWN, NEUTRAL = "#26a69a", "#ef5350", "#ffca28"
 DISCLAIMER = "Informational only. Not financial advice. Patterns do not predict future prices."
@@ -232,7 +238,8 @@ def _merge_settings(saved: dict) -> dict:
         raw_perps = []
     settings["polymarket_perps"] = [
         {"instrument_id": int(item["instrument_id"]), "symbol": str(item["symbol"]).strip().upper(),
-         "data_source": "yahoo" if item.get("data_source") == "yahoo" else "polymarket"}
+         "data_source": "yahoo" if item.get("data_source") == "yahoo" else "polymarket",
+         "yahoo_symbol": str(item.get("yahoo_symbol") or item["symbol"]).strip().upper()}
         for item in raw_perps if isinstance(item, dict)
         and str(item.get("instrument_id", "")).isdigit() and item.get("symbol")
     ]
@@ -299,24 +306,44 @@ class FetchResult:
     fetched_at: datetime
 
 
+def _yahoo_history(symbol: str, **kwargs) -> pd.DataFrame:
+    """Fetch Yahoo candles, including equity extended hours for intraday data."""
+    global _YAHOO_CACHE_PRIMED
+    interval = kwargs.get("interval")
+    if (interval in {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
+            and not symbol.startswith("^") and not is_crypto(symbol)):
+        kwargs.setdefault("prepost", True)
+    if _YAHOO_CACHE_PRIMED:
+        return yf.Ticker(symbol).history(**kwargs)
+    with _YAHOO_INIT_LOCK:
+        if not _YAHOO_CACHE_PRIMED:
+            try:
+                return yf.Ticker(symbol).history(**kwargs)
+            finally:
+                _YAHOO_CACHE_PRIMED = True
+    return yf.Ticker(symbol).history(**kwargs)
+
+
 def watched_symbols(settings: dict) -> list:
     """Prefer Yahoo symbols; use a Polymarket alias only when Yahoo has no recent data."""
     perps = {item["symbol"]: item for item in settings.get("polymarket_perps", [])}
 
     def resolved_symbol(ticker):
         item = perps.get(ticker)
-        return f"{ticker}-PERP" if item and item.get("data_source") == "polymarket" else ticker
+        if item and item.get("data_source") == "polymarket":
+            return f"{ticker}-PERP"
+        return item.get("yahoo_symbol", ticker) if item else ticker
 
     symbols = [resolved_symbol(symbol) for symbol in settings.get("watchlist", [])]
     symbols.extend(resolved_symbol(item["symbol"]) for item in perps.values())
     return list(dict.fromkeys(symbols))
 
 
-def _yahoo_has_recent_daily_data(symbol: str) -> Optional[bool]:
-    """Return whether Yahoo has recent daily candles; None means the availability check failed."""
+def _yahoo_has_recent_market_data(symbol: str) -> Optional[bool]:
+    """Return whether Yahoo has recent 15m candles; None means the availability check failed."""
     try:
-        raw = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=False,
-                                        actions=False, timeout=12)
+        raw = _yahoo_history(symbol, period="5d", interval="15m", auto_adjust=False,
+                             actions=False, timeout=12)
         if raw is None or raw.empty:
             return False
         latest = pd.Timestamp(raw.index[-1])
@@ -356,20 +383,25 @@ def refresh_polymarket_perps(settings: dict, force=False) -> dict:
         raise ValueError("Polymarket Perps API returned no equity instruments; keeping the last known list.")
 
     old_sources = {
-        item["symbol"]: item.get("data_source", "polymarket")
+        item["symbol"]: {"data_source": item.get("data_source", "polymarket"),
+                         "yahoo_symbol": item.get("yahoo_symbol", item["symbol"])}
         for item in settings.get("polymarket_perps", [])
     }
 
     def resolve_source(item):
         ticker = item["symbol"]
-        available = _yahoo_has_recent_daily_data(ticker)
-        source = ("yahoo" if available else "polymarket") if available is not None else old_sources.get(ticker, "polymarket")
-        return ticker, source
+        yahoo_symbol = YAHOO_TICKER_ALIASES.get(ticker, ticker)
+        available = _yahoo_has_recent_market_data(yahoo_symbol)
+        source = ("yahoo" if available else "polymarket") if available is not None else old_sources.get(ticker, {}).get("data_source", "polymarket")
+        if available is None:
+            yahoo_symbol = old_sources.get(ticker, {}).get("yahoo_symbol", yahoo_symbol)
+        return ticker, source, yahoo_symbol
 
     with ThreadPoolExecutor(max_workers=SCANNER_MAX_WORKERS, thread_name_prefix="tim-source-check") as pool:
-        sources = dict(pool.map(resolve_source, instruments.values()))
+        sources = {ticker: (source, yahoo_symbol)
+                   for ticker, source, yahoo_symbol in pool.map(resolve_source, instruments.values())}
     for alias, item in instruments.items():
-        item["data_source"] = sources[item["symbol"]]
+        item["data_source"], item["yahoo_symbol"] = sources[item["symbol"]]
 
     with RT.cache_lock:
         RT.polymarket_instruments = instruments
@@ -440,8 +472,8 @@ def _download(symbol: str, tf: str) -> FetchResult:
     cfg = TIMEFRAMES[tf]
     fetched_at = utc_now()
     try:
-        raw = yf.Ticker(symbol).history(period=cfg["period"], interval=cfg["interval"],
-                                        auto_adjust=False, actions=False)
+        raw = _yahoo_history(symbol, period=cfg["period"], interval=cfg["interval"],
+                             auto_adjust=False, actions=False)
     except Exception as exc:
         return FetchResult(None, f"Yahoo Finance request failed for {symbol} ({tf}): {exc}", fetched_at)
     if raw is None or raw.empty:
@@ -515,7 +547,12 @@ def fetch_candles(symbol: str, tf: str) -> FetchResult:
         RT.metrics["market_latency_ms_total"] += elapsed_ms
         if result.df is None:
             RT.metrics["market_errors"] += 1
-    ttl = TIMEFRAMES[tf]["ttl"] if result.df is not None else 20
+    if result.df is not None:
+        ttl = TIMEFRAMES[tf]["ttl"]
+    elif result.error and result.error.startswith("No "):
+        ttl = 300  # missing/delisted symbols should not be requested again every monitor cycle
+    else:
+        ttl = 20
     with RT.cache_lock:
         RT.cache[key] = (time.time() + ttl, result)
         completed = RT.fetch_inflight.pop(key, None)
@@ -552,8 +589,10 @@ def closed_candles(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     return df[df.index + delta <= now_naive_utc()]
 
 
-def data_age_minutes(df: pd.DataFrame) -> float:
-    return (now_naive_utc() - df.index[-1]).total_seconds() / 60
+def data_age_minutes(df: pd.DataFrame, tf: str) -> float:
+    """Age from the most recent candle's close, not its opening timestamp."""
+    candle_close = df.index[-1] + pd.Timedelta(minutes=INTERVAL_MIN[tf])
+    return max(0.0, (now_naive_utc() - candle_close).total_seconds() / 60)
 
 
 def price_change(df: pd.DataFrame, minutes: int):
@@ -580,7 +619,7 @@ def pct_change_over(df, minutes):
     return price_change(df, minutes)[0]
 
 
-def get_snapshot_from_result(symbol: str, res: FetchResult) -> dict:
+def get_snapshot_from_result(symbol: str, res: FetchResult, tf: Optional[str] = None) -> dict:
     crypto = is_crypto(symbol)
     base = {"asset": symbol, "type": "Crypto" if crypto else "Index" if symbol.startswith("^") else "Stock"}
     if res.df is None or res.df.empty:
@@ -593,7 +632,8 @@ def get_snapshot_from_result(symbol: str, res: FetchResult) -> dict:
         v = pct_change_over(df, minutes)
         return nan if v is None else v
 
-    age = data_age_minutes(df)
+    tf = tf or ("15m" if symbol.endswith("-PERP") else "5m")
+    age = data_age_minutes(df, tf)
     return {**base, "error": None, "price": float(df["Close"].iloc[-1]),
             "chg_5m": pc(5), "chg_1h": pc(60), "chg_24h": pc(1440),
             "last_candle": df.index[-1], "age": age,
@@ -603,7 +643,7 @@ def get_snapshot_from_result(symbol: str, res: FetchResult) -> dict:
 
 def get_snapshot(symbol: str) -> dict:
     tf = "15m" if symbol.endswith("-PERP") else "5m"
-    return get_snapshot_from_result(symbol, fetch_candles(symbol, tf))
+    return get_snapshot_from_result(symbol, fetch_candles(symbol, tf), tf)
 
 
 # =============================================================================
@@ -2510,7 +2550,10 @@ def process_event(ev: dict, ind: pd.DataFrame, tf: str, settings: dict):
     routed = tf in PATTERN_SCAN_TFS and tf in settings.get("telegram_timeframes", PATTERN_SCAN_TFS)
     quality_ok = passes_notification_quality(ev, settings)
     prediction_id = None
-    if is_prediction_event(ev) and quality_ok and tf in PATTERN_SCAN_TFS:
+    # Notification quality is a Telegram noise filter. Keep every confirmed
+    # directional signal in the paper ledger so the strategy can be evaluated
+    # independently of the alert-delivery threshold.
+    if is_prediction_event(ev) and tf in PATTERN_SCAN_TFS:
         prediction_id = record_prediction(alert_id, ev, tf, settings, ind)
     if ev["notify"] and quality_ok and routed and telegram_configured():
         ok, info = send_alert_notification(ev, ind, tf)
@@ -2535,7 +2578,7 @@ def scan_symbol(symbol: str, settings: dict):
     res5 = fetch_candles(symbol, snapshot_tf)
     try:
         if res5.df is not None and not res5.df.empty:
-            save_market_snapshot(get_snapshot_from_result(symbol, res5))
+            save_market_snapshot(get_snapshot_from_result(symbol, res5, snapshot_tf))
         else:
             save_market_snapshot({"asset": symbol,
                                   "type": "Crypto" if is_crypto(symbol) else "Index" if symbol.startswith("^") else "Stock",
@@ -3032,12 +3075,30 @@ def predictions_fragment():
         "Last checked candle (UTC)": df["mark_time"],
         "Signal explanation": df["description"],
     })
-    styled = table.style.map(_color_pct, subset=["P&L % equity", "P&L R"]).format(
-        {"Entry price": fmt_price, "Stop": fmt_price, "Target": fmt_price,
-         "Exit price": fmt_price, "Mark price": fmt_price,
-         "Risk $": "${:,.2f}", "Realized P&L $": "${:+,.2f}", "Open P&L $": "${:+,.2f}",
-         "P&L % equity": "{:+.2f}%", "P&L R": "{:+.2f}R", "Position units": "{:.6f}"})
-    st.dataframe(styled, hide_index=True, use_container_width=True)
+    # Render nullable numeric columns explicitly. Styler's format callbacks
+    # can raise on pandas nullable values (for example pd.NA in open trades).
+    display_table = table.copy()
+
+    def _safe_display(value, formatter):
+        if value is None or pd.isna(value):
+            return "—"
+        try:
+            return formatter(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return "—"
+
+    for column in ("Entry price", "Stop", "Target", "Exit price", "Mark price"):
+        display_table[column] = display_table[column].map(lambda value: _safe_display(value, fmt_price))
+    for column, formatter in {
+        "Position units": lambda value: f"{value:.6f}",
+        "Risk $": lambda value: f"${value:,.2f}",
+        "Realized P&L $": lambda value: f"${value:+,.2f}",
+        "Open P&L $": lambda value: f"${value:+,.2f}",
+        "P&L % equity": lambda value: f"{value:+.2f}%",
+        "P&L R": lambda value: f"{value:+.2f}R",
+    }.items():
+        display_table[column] = display_table[column].map(lambda value, fn=formatter: _safe_display(value, fn))
+    st.dataframe(display_table, hide_index=True, use_container_width=True)
     st.caption("P&L is simulated and gross before fees, funding, spread, slippage and execution constraints. "
                "Each trade risks 2% of equity at entry; the target is 3 times the entry-to-stop distance. "
                "This ledger does not place real orders.")
