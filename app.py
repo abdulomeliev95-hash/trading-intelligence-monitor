@@ -1676,13 +1676,17 @@ def evaluate_due_predictions(settings=None) -> int:
     for (pred_id, asset, tf, direction, entry, stop, target, signal_time, last_checked,
          risk_amount, units, equity_at_entry) in due:
         try:
-            res = fetch_candles(asset, tf)
+            # Keep open-trade marks and stop/target checks current on a 15m
+            # candle cadence, regardless of the signal's strategy timeframe.
+            # The signal timeframe remains metadata; there is no time-based exit.
+            evaluation_tf = "15m"
+            res = fetch_candles(asset, evaluation_tf)
             if res.df is None or res.df.empty:
                 continue  # data provider may be temporarily unavailable; retry next monitor cycle
-            closed = closed_candles(res.df, tf)
+            closed = closed_candles(res.df, evaluation_tf)
             if closed.empty:
                 continue
-            candle_closes = closed.index + pd.Timedelta(minutes=INTERVAL_MIN[tf])
+            candle_closes = closed.index + pd.Timedelta(minutes=INTERVAL_MIN[evaluation_tf])
             start_after = pd.Timestamp(last_checked or signal_time)
             eligible = np.flatnonzero(candle_closes > start_after)
             if len(eligible) == 0:
@@ -2583,6 +2587,9 @@ def scan_symbol(symbol: str, settings: dict):
             save_market_snapshot({"asset": symbol,
                                   "type": "Crypto" if is_crypto(symbol) else "Index" if symbol.startswith("^") else "Stock",
                                   "error": res5.error or "No market data", "stale": True})
+            if symbol.endswith("-PERP"):
+                log.warning("No dashboard candles for %s from Polymarket Perps: %s",
+                            symbol, res5.error or "empty response")
     except Exception as exc:
         log.warning("Could not publish dashboard snapshot for %s: %s", symbol, redact(exc))
     for tf in PATTERN_SCAN_TFS:
